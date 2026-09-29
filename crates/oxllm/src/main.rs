@@ -305,38 +305,30 @@ fn is_tailnet_or_loopback(ip: IpAddr) -> bool {
     }
 }
 
-async fn localhost_only(
+async fn tailnet_only(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let is_local = match addr.ip() {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        // Dual-stack bindings present IPv4 connections as IPv4-mapped IPv6
-        // addresses like ::ffff:127.0.0.1. to_canonical() converts these to
-        // their IPv4 representation so is_loopback() works correctly.
-        IpAddr::V6(v6) => v6.is_loopback() || v6.to_canonical().is_loopback(),
-    };
-    if is_local {
-        next.run(req).await
-    } else {
-        warn!(target: "oxllm::security", "Blocked external attempt to access administrative route from IP: {}", addr.ip());
-        let body = serde_json::json!({
-            "error": {
-                "message": "Access denied: administrative routes are localhost-only",
-                "type": "forbidden",
-                "code": 403
-            }
-        });
-        let bytes = serde_json::to_vec(&body).unwrap();
-        let mut response = Response::new(Body::from(bytes));
-        *response.status_mut() = StatusCode::FORBIDDEN;
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        response
+    if is_tailnet_or_loopback(addr.ip()) {
+        return next.run(req).await;
     }
+
+    warn!(target: "oxllm::security", peer = %addr.ip(), "Blocked request from outside loopback and tailnet source ranges");
+    let body = serde_json::json!({
+        "error": {
+            "message": "Access denied: source is outside the permitted tailnet and loopback ranges",
+            "type": "forbidden",
+            "code": 403
+        }
+    });
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 async fn health_check() -> impl IntoResponse {
@@ -513,6 +505,40 @@ async fn handle_sighup(
     }
 }
 
+fn build_router(reloadable_state: ReloadableState) -> axum::Router {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/v1/models", get(routes::list_models))
+        .route("/v1/embeddings", post(routes::create_embeddings))
+        .route(
+            "/v1/chat/completions",
+            post(routes::create_chat_completions),
+        )
+        .route("/status", get(routes::get_status))
+        .route("/dashboard", get(routes::dashboard))
+        .route("/health", get(health_check))
+        .route("/reload", post(handle_http_reload))
+        .route(
+            "/admin/providers/{name}/offline",
+            post(routes::admin_offline),
+        )
+        .route("/admin/providers/{name}/online", post(routes::admin_online))
+        .route("/admin/providers/{name}/reset", post(routes::admin_reset))
+        .layer(middleware::from_fn(tailnet_only))
+        .layer(middleware::from_fn(add_request_id))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers(Any),
+        )
+        .with_state(reloadable_state)
+}
+
 async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_config_path(config_path);
     // 1. Load initial config
@@ -554,54 +580,7 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         reloader,
     };
 
-    use axum::routing::{get, post};
-    let app = axum::Router::new()
-        .route("/v1/models", get(routes::list_models))
-        .route("/v1/embeddings", post(routes::create_embeddings))
-        .route(
-            "/v1/chat/completions",
-            post(routes::create_chat_completions),
-        )
-        .route(
-            "/status",
-            get(routes::get_status).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/dashboard",
-            get(routes::dashboard).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/health",
-            get(health_check).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/reload",
-            post(handle_http_reload).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/admin/providers/{name}/offline",
-            post(routes::admin_offline).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/admin/providers/{name}/online",
-            post(routes::admin_online).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/admin/providers/{name}/reset",
-            post(routes::admin_reset).layer(middleware::from_fn(localhost_only)),
-        )
-        .layer(middleware::from_fn(add_request_id))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::OPTIONS,
-                ])
-                .allow_headers(Any),
-        )
-        .with_state(reloadable_state);
+    let app = build_router(reloadable_state);
 
     // Write PID file
     if let Err(e) = write_pid_file() {
@@ -1195,7 +1174,12 @@ mod integration_tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1293,7 +1277,12 @@ mod integration_tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1474,7 +1463,12 @@ mod integration_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1607,7 +1601,12 @@ mod integration_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1718,7 +1717,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         // Call admin reset
@@ -1831,7 +1835,12 @@ mod integration_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1920,7 +1929,12 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2004,7 +2018,12 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         // Verify provider is disabled
@@ -2105,7 +2124,12 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2319,30 +2343,9 @@ mod integration_tests {
         }
     }
 
-    /// Builds a test router with all middleware layers (request-id, CORS).
+    /// Uses the exact router and security middleware wired by production.
     fn build_test_router(state: ReloadableState) -> axum::Router {
-        axum::Router::new()
-            .route(
-                "/v1/chat/completions",
-                axum::routing::post(routes::create_chat_completions),
-            )
-            .route(
-                "/v1/embeddings",
-                axum::routing::post(routes::create_embeddings),
-            )
-            .route("/v1/models", axum::routing::get(routes::list_models))
-            .layer(middleware::from_fn(add_request_id))
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([
-                        axum::http::Method::GET,
-                        axum::http::Method::POST,
-                        axum::http::Method::OPTIONS,
-                    ])
-                    .allow_headers(Any),
-            )
-            .with_state(state)
+        build_router(state)
     }
 
     // -----------------------------------------------------------------------
@@ -2369,7 +2372,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2417,7 +2425,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2466,7 +2479,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2521,7 +2539,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2569,7 +2592,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2620,7 +2648,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2680,7 +2713,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
