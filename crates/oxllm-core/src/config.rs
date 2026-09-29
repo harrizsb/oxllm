@@ -5,6 +5,7 @@ use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -16,6 +17,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProviderConfig {
     pub name: String,
     pub enabled: bool,
@@ -25,6 +27,7 @@ pub struct ProviderConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VirtualModelTarget {
     pub provider: String,
     pub model: String,
@@ -33,6 +36,7 @@ pub struct VirtualModelTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub server: ServerConfig,
     pub providers: Vec<ProviderConfig>,
@@ -81,6 +85,21 @@ impl Config {
                 )));
             },
         }
+        for provider in self.providers.iter().filter(|provider| provider.enabled) {
+            let url = reqwest::Url::parse(&provider.base_url).map_err(|error| {
+                OxllmError::ConfigLoad(format!(
+                    "Invalid base URL for enabled provider '{}': {}",
+                    provider.name, error
+                ))
+            })?;
+            if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+                return Err(OxllmError::ConfigLoad(format!(
+                    "Invalid base URL for enabled provider '{}': expected an http or https URL with a host",
+                    provider.name
+                )));
+            }
+        }
+
         let provider_map: HashMap<&str, &ProviderConfig> = self
             .providers
             .iter()
