@@ -55,7 +55,8 @@ tasks:
     categories: *id001
 - id: 5
   description: Test same-origin config read/validate succeeds and foreign Origin read/validate
-    is rejected; validate valid TOML, syntax error, unknown field, missing env var,
+    is rejected; include null, malformed, duplicate, and scheme/host/port mismatch
+    Origin cases; validate valid TOML, syntax error, unknown field, missing env var,
     dangling virtual-model provider, zero target weight, malformed enabled-provider
     base_url; assert file bytes and .bak unchanged for every case
   verify: cargo test -p oxllm validate_config

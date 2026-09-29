@@ -31,7 +31,9 @@ tasks:
 - id: 3
   description: 'Implement one-generation backup and atomic swap: backup exactly old
     bytes; stage new config in same directory; flush+sync; rename; preserve permissions;
-    on pre-commit failure original file and active state remain unchanged'
+    inject failures during temp write/sync, backup replacement and config rename; before
+    commit, config, previous .bak and active state remain unchanged; failed rollback is
+    surfaced distinctly'
   verify: cargo test -p oxllm apply_atomic
   risk: P0
   status: failing
@@ -43,7 +45,8 @@ tasks:
   description: Publish prebuilt state using existing watch sender and shared RuntimeMetrics;
     on publication failure restore old config atomically; test backup exactness, new
     bytes, second backup overwrite, status change without restart, metrics continuity,
-    old state retained on validation failure
+    old state retained on validation failure, rollback on publish failure, prior config
+    and .bak exactness after injected filesystem failures
   verify: cargo test -p oxllm apply_reload_continuity
   risk: P0
   status: failing
