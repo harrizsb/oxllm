@@ -3420,3 +3420,46 @@ models = ["model"]
         ));
     }
 }
+
+#[cfg(test)]
+mod apply_tests {
+    //! e01s03: Apply pipeline, one-generation backup, atomic swap, serialization,
+    //! and continuity tests.
+    use super::*;
+
+    #[test]
+    fn reloader_reload_lock_serializes_across_clones() {
+        // Task 1: Verify the reload/apply lock exists on Reloader and serializes
+        // across clones of Reloader, preventing concurrent HTTP reload,
+        // SIGHUP, and Apply operations.
+        let (_sender, _receiver) = tokio::sync::watch::channel(Arc::new(AppState {
+            providers: vec![],
+            virtual_models: std::collections::HashMap::new(),
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::new(),
+            upstream_timeout_secs: 5,
+        }));
+        let reloader = Reloader {
+            sender: _sender,
+            config_path: PathBuf::from("config.toml"),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let clone = reloader.clone();
+        let guard = reloader.reload_lock.try_lock();
+        assert!(
+            guard.is_ok(),
+            "First try_lock on reload_lock should succeed"
+        );
+        assert!(
+            clone.reload_lock.try_lock().is_err(),
+            "Cloned reloader lock should be busy while held by the first instance"
+        );
+        drop(guard);
+        assert!(
+            clone.reload_lock.try_lock().is_ok(),
+            "Once released, clone should be able to acquire the reload_lock"
+        );
+    }
+}
