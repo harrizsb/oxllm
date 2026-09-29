@@ -1,6 +1,6 @@
 story_id: e01s02
 title: Raw config view + Validate dry-run on the dashboard
-status: todo
+status: done
 bcps: 5
 tasks:
 - id: 1
@@ -10,7 +10,7 @@ tasks:
     configs
   verify: cargo test -p oxllm-core config_validation
   risk: P0
-  status: failing
+  status: passing
   security: medium
   allure:
     severity: critical
@@ -23,7 +23,7 @@ tasks:
   verify: cargo test -p oxllm-core unknown_field && cargo run -- validate --config
     config.toml
   risk: P1
-  status: failing
+  status: passing
   security: low
   allure:
     severity: high
@@ -36,7 +36,7 @@ tasks:
     read is refused
   verify: cargo test -p oxllm config_raw
   risk: P1
-  status: failing
+  status: passing
   security: medium
   allure:
     severity: high
@@ -48,7 +48,7 @@ tasks:
     return structured diagnostics incl parser span where supported; never write'
   verify: cargo test -p oxllm validate_config
   risk: P0
-  status: failing
+  status: passing
   security: medium
   allure:
     severity: critical
@@ -61,7 +61,7 @@ tasks:
     base_url; assert file bytes and .bak unchanged for every case
   verify: cargo test -p oxllm validate_config
   risk: P0
-  status: failing
+  status: passing
   security: medium
   allure:
     severity: critical
@@ -72,7 +72,7 @@ tasks:
     embedded include_str! unchanged
   verify: cargo test -p oxllm dashboard && grep -q config-editor crates/oxllm/src/dashboard.html
   risk: P1
-  status: failing
+  status: passing
   security: low
   allure:
     severity: high
@@ -82,7 +82,7 @@ tasks:
   verify: cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
     && cargo test --workspace
   risk: P1
-  status: failing
+  status: passing
   security: medium
   allure:
     severity: high
