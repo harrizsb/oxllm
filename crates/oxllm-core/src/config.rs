@@ -28,6 +28,8 @@ pub struct ProviderConfig {
 pub struct VirtualModelTarget {
     pub provider: String,
     pub model: String,
+    #[serde(default = "default_virtual_model_weight")]
+    pub weight: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +75,13 @@ impl Config {
             }
 
             for target in targets {
+                if target.weight == 0 {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Virtual model '{}' target for provider '{}' must have a positive weight",
+                        vm_name, target.provider
+                    )));
+                }
+
                 match provider_map.get(target.provider.as_str()) {
                     Some(provider) => {
                         if !provider.enabled {
@@ -92,6 +101,10 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn default_virtual_model_weight() -> u32 {
+    1
 }
 
 fn default_upstream_timeout() -> u64 {
@@ -148,6 +161,29 @@ pub fn expand_env_vars(raw_content: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_model_target_defaults_weight_to_one() {
+        let target: VirtualModelTarget = toml::from_str(
+            r#"provider = "provider-a"
+model = "model-a""#,
+        )
+        .unwrap();
+
+        assert_eq!(target.weight, 1);
+    }
+
+    #[test]
+    fn virtual_model_target_reads_configured_weight() {
+        let target: VirtualModelTarget = toml::from_str(
+            r#"provider = "provider-a"
+model = "model-a"
+weight = 3"#,
+        )
+        .unwrap();
+
+        assert_eq!(target.weight, 3);
+    }
 
     #[test]
     fn test_expand_env_vars_success() {

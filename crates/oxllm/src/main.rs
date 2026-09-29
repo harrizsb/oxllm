@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -222,6 +222,7 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
     Ok(AppState {
         providers,
         virtual_models: config.virtual_models,
+        swrr_current: Mutex::new(std::collections::HashMap::new()),
         http_client,
         upstream_timeout_secs: config.server.upstream_timeout_secs,
     })
@@ -1066,10 +1067,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "prov1".to_string(),
                     model: "gpt-4-upstream".to_string(),
+                    weight: 1,
                 },
                 VirtualModelTarget {
                     provider: "prov2".to_string(),
                     model: "gpt-4-upstream".to_string(),
+                    weight: 1,
                 },
             ],
         );
@@ -1078,6 +1081,7 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1165,6 +1169,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov1".to_string(),
                 model: "gpt-4-upstream".to_string(),
+                weight: 1,
             }],
         );
 
@@ -1172,6 +1177,7 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1344,10 +1350,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "p1".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
             ],
         );
@@ -1355,6 +1363,7 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1472,10 +1481,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "p1".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
             ],
         );
@@ -1483,6 +1494,7 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1572,12 +1584,14 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "resetme".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
 
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1689,12 +1703,14 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "emb".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
 
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1779,12 +1795,14 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov".into(),
                 model: "real-model".into(),
+                weight: 1,
             }],
         );
 
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1861,11 +1879,13 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "target".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1955,11 +1975,13 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "counter".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2048,12 +2070,14 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
 
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });

@@ -264,7 +264,7 @@ pub async fn create_embeddings(
         },
     };
 
-    let candidates = app_state.resolve_candidates(requested_model);
+    let candidates = app_state.resolve_candidates(requested_model).await;
     if candidates.is_empty() {
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
@@ -566,7 +566,7 @@ pub async fn create_chat_completions(
         },
     };
 
-    let candidates = app_state.resolve_candidates(requested_model);
+    let candidates = app_state.resolve_candidates(requested_model).await;
     if candidates.is_empty() {
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
