@@ -505,6 +505,199 @@ async fn handle_sighup(
     }
 }
 
+fn editor_origin_matches_host(origin: &HeaderValue, host: &HeaderValue) -> bool {
+    let origin_str = match origin.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return false,
+    };
+    let host_str = match host.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return false,
+    };
+    if origin_str == "null" || host_str.is_empty() {
+        return false;
+    }
+    // Origin syntax: scheme "://" host [ ":" port ] with no trailing path.
+    let (scheme, rest) = match origin_str.split_once("://") {
+        Some(pair) => pair,
+        None => return false,
+    };
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
+        return false;
+    }
+    // Strip default ports so http://example.com:80 matches Host: example.com
+    let origin_authority = match (scheme, rest.split_once(':')) {
+        ("http", Some((h, "80"))) => h,
+        ("https", Some((h, "443"))) => h,
+        _ => rest,
+    };
+    let host_authority = match host_str.split_once(':') {
+        Some((h, "80")) => h,
+        Some((h, "443")) => h,
+        _ => host_str,
+    };
+    origin_authority.eq_ignore_ascii_case(host_authority)
+}
+
+async fn require_same_origin(req: Request<Body>, next: Next) -> Response {
+    let origin_values: Vec<&HeaderValue> = req.headers().get_all(header::ORIGIN).iter().collect();
+    if origin_values.is_empty() {
+        return next.run(req).await;
+    }
+    if origin_values.len() != 1 {
+        warn!(target: "oxllm::security", "Rejected editor request with multiple Origin headers");
+        return origin_denied_response();
+    }
+    let host_header = match req.headers().get(header::HOST) {
+        Some(host) => host,
+        None => {
+            warn!(target: "oxllm::security", "Rejected editor request with Origin but no Host header");
+            return origin_denied_response();
+        },
+    };
+    if !editor_origin_matches_host(origin_values[0], host_header) {
+        warn!(
+            target: "oxllm::security",
+            origin = ?origin_values[0],
+            host = ?host_header,
+            "Rejected cross-origin editor request"
+        );
+        return origin_denied_response();
+    }
+    next.run(req).await
+}
+
+fn origin_denied_response() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Access denied: cross-origin requests to editor endpoints are not permitted",
+            "type": "forbidden",
+            "code": 403
+        }
+    });
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// GET /config — raw bytes of config.toml without environment expansion.
+async fn handle_get_config(
+    axum::extract::State(reloader): axum::extract::State<Reloader>,
+) -> Response {
+    match tokio::fs::read(&reloader.config_path).await {
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        },
+        Err(e) => {
+            error!(path = %reloader.config_path.display(), error = %e, "Failed to read raw config file");
+            let body = serde_json::json!({
+                "error": {
+                    "message": format!("Failed to read config file: {}", e),
+                    "type": "internal_error",
+                    "code": 500
+                }
+            });
+            let mut response = Response::new(Body::from(body.to_string()));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ValidateRequest {
+    config: String,
+}
+
+#[derive(serde::Serialize)]
+struct ValidationErrorItem {
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    col: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct ValidateResponse {
+    valid: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<ValidationErrorItem>,
+}
+
+/// Dry-runs parse -> expand_env_vars -> strict Config::validate -> build_app_state.
+fn validate_config_candidate(
+    raw_content: &str,
+    metrics: Arc<RuntimeMetrics>,
+) -> std::result::Result<(), (String, Option<usize>, Option<usize>)> {
+    let expanded = match oxllm_core::config::expand_env_vars(raw_content) {
+        Ok(expanded) => expanded,
+        Err(e) => return Err((e.to_string(), None, None)),
+    };
+    let config: Config = match toml::from_str(&expanded) {
+        Ok(c) => c,
+        Err(e) => {
+            let (line, col) = e.span().map_or((None, None), |span| {
+                let prefix = &expanded[..span.start.min(expanded.len())];
+                let line = prefix.lines().count().max(1);
+                let col = prefix.lines().last().map_or(1, |l| l.len() + 1);
+                (Some(line), Some(col))
+            });
+            return Err((e.to_string(), line, col));
+        },
+    };
+    if let Err(e) = config.validate() {
+        return Err((e.to_string(), None, None));
+    }
+    if let Err(e) = build_app_state(config, metrics) {
+        return Err((e, None, None));
+    }
+    Ok(())
+}
+
+/// POST /validate — dry-run validator, performs zero writes.
+async fn handle_post_validate(
+    axum::extract::State(reloader): axum::extract::State<Reloader>,
+    axum::Json(payload): axum::Json<ValidateRequest>,
+) -> (StatusCode, axum::Json<ValidateResponse>) {
+    match validate_config_candidate(&payload.config, reloader.metrics.clone()) {
+        Ok(()) => (
+            StatusCode::OK,
+            axum::Json(ValidateResponse {
+                valid: true,
+                errors: vec![],
+            }),
+        ),
+        Err((message, line, col)) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(ValidateResponse {
+                valid: false,
+                errors: vec![ValidationErrorItem { message, line, col }],
+            }),
+        ),
+    }
+}
+
 fn build_router(reloadable_state: ReloadableState) -> axum::Router {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -517,6 +710,14 @@ fn build_router(reloadable_state: ReloadableState) -> axum::Router {
         .route("/status", get(routes::get_status))
         .route("/dashboard", get(routes::dashboard))
         .route("/health", get(health_check))
+        .route(
+            "/config",
+            get(handle_get_config).layer(middleware::from_fn(require_same_origin)),
+        )
+        .route(
+            "/validate",
+            post(handle_post_validate).layer(middleware::from_fn(require_same_origin)),
+        )
         .route("/reload", post(handle_http_reload))
         .route(
             "/admin/providers/{name}/offline",
@@ -2868,15 +3069,19 @@ models = ["model"]
             .method(method)
             .uri(uri)
             .header(header::HOST, "127.0.0.1:8080");
-        if let Some(bytes) = body {
+        if body.is_some() {
             builder = builder.header(header::CONTENT_TYPE, "application/json");
-            return builder
-                .body(Body::from(bytes))
-                .expect("static test request must build");
         }
-        builder
-            .body(Body::empty())
-            .expect("static test request must build")
+        let mut request = builder
+            .body(body.map_or_else(Body::empty, Body::from))
+            .expect("static test request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                12345u16,
+            ))));
+        request
     }
 
     async fn editor_router(config_path: std::path::PathBuf) -> axum::Router {
