@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Virtual models with weighted routing**: `[virtual_models]` config section maps a client-facing
+  model name to provider targets with optional `weight` (default 1). Targets are picked with
+  smooth weighted round-robin; the remaining targets stay ordered as fallbacks. Virtual model
+  names shadow provider models with a startup warning.
+- **Daily token accounting**: cached / uncached / total token counters sourced from the provider
+  `usage` field, reset at the UTC day boundary via lock-free compare-and-swap rollover.
+- **Last-3 request log**: in-memory ring buffer of the three most recent requests (model,
+  virtual model, provider, cached/uncached tokens, status).
+- **Read-only dashboard**: `GET /dashboard` (localhost only) shows today's token totals, the
+  virtual-model routing table (targets, weights, circuit state, request counts), and the recent
+  requests; fed by the extended `/status` payload. Embedded at compile time via `include_str!`,
+  no build step.
+
 ## [0.1.12] - 2026-06-01
 
 ### Fixed

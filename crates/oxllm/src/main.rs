@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -18,6 +18,7 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use oxllm_core::config::Config;
+use oxllm_core::runtime::RuntimeMetrics;
 use oxllm_core::state::{AppState, CircuitState, ProviderState};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
 use reqwest::Url;
@@ -143,6 +144,7 @@ enum ProviderCommand {
 pub struct Reloader {
     sender: tokio::sync::watch::Sender<Arc<AppState>>,
     config_path: PathBuf,
+    metrics: Arc<RuntimeMetrics>,
 }
 
 #[derive(Clone)]
@@ -183,7 +185,7 @@ impl axum::extract::FromRef<ReloadableState> for Reloader {
     }
 }
 
-fn build_app_state(config: Config) -> Result<AppState, String> {
+fn build_app_state(config: Config, metrics: Arc<RuntimeMetrics>) -> Result<AppState, String> {
     let mut providers = Vec::new();
     for p in config.providers {
         if !p.enabled {
@@ -214,6 +216,23 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
         });
     }
 
+    // Virtual models take precedence over provider model names; warn so shadowing is explicit.
+    for (virtual_name, targets) in &config.virtual_models {
+        if providers
+            .iter()
+            .any(|provider| provider.models.iter().any(|model| model == virtual_name))
+        {
+            warn!(
+                virtual_model = %virtual_name,
+                "Virtual model shadows a real provider model name; virtual model routing takes precedence"
+            );
+        }
+        if targets.is_empty() {
+            // Validation rejects this; retain a defensive startup diagnostic if state is built directly.
+            warn!(virtual_model = %virtual_name, "Virtual model has no routing targets");
+        }
+    }
+
     let http_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
@@ -222,6 +241,8 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
     Ok(AppState {
         providers,
         virtual_models: config.virtual_models,
+        swrr_current: Mutex::new(std::collections::HashMap::new()),
+        metrics,
         http_client,
         upstream_timeout_secs: config.server.upstream_timeout_secs,
     })
@@ -380,7 +401,7 @@ async fn handle_http_reload(
         );
         return response;
     }
-    match build_app_state(config) {
+    match build_app_state(config, reloader.metrics.clone()) {
         Ok(new_state) => {
             if reloader.sender.send(Arc::new(new_state)).is_ok() {
                 info!("Configuration reloaded via HTTP POST /reload");
@@ -436,6 +457,7 @@ async fn handle_http_reload(
 async fn handle_sighup(
     config_path: PathBuf,
     watch_sender: tokio::sync::watch::Sender<Arc<AppState>>,
+    metrics: Arc<RuntimeMetrics>,
 ) {
     #[cfg(unix)]
     {
@@ -457,7 +479,7 @@ async fn handle_sighup(
                         error!("Configuration validation failed during hot-reload: {}", e);
                         continue;
                     }
-                    match build_app_state(new_config) {
+                    match build_app_state(new_config, metrics.clone()) {
                         Ok(new_state) => {
                             if let Err(e) = watch_sender.send(Arc::new(new_state)) {
                                 error!("Failed to update watch channel: {}", e);
@@ -485,7 +507,8 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
     config.validate()?;
 
     // 2. Build initial AppState
-    let app_state = Arc::new(build_app_state(config.clone())?);
+    let metrics = Arc::new(RuntimeMetrics::default());
+    let app_state = Arc::new(build_app_state(config.clone(), metrics.clone())?);
 
     // 3. Initialize watch channel
     let (watch_sender, watch_receiver) = tokio::sync::watch::channel(app_state.clone());
@@ -498,13 +521,18 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // 5. Spawn SIGHUP listener
     let config_path_clone = config_path.clone();
-    tokio::spawn(handle_sighup(config_path_clone, watch_sender.clone()));
+    tokio::spawn(handle_sighup(
+        config_path_clone,
+        watch_sender.clone(),
+        metrics.clone(),
+    ));
 
     // 6. Build Axum Router
     let start_time = Instant::now();
     let reloader = Reloader {
         sender: watch_sender.clone(),
         config_path: config_path.clone(),
+        metrics: metrics.clone(),
     };
     let reloadable_state = ReloadableState {
         app_state: watch_receiver,
@@ -524,6 +552,10 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         .route(
             "/status",
             get(routes::get_status).layer(middleware::from_fn(localhost_only)),
+        )
+        .route(
+            "/dashboard",
+            get(routes::dashboard).layer(middleware::from_fn(localhost_only)),
         )
         .route(
             "/health",
@@ -1066,10 +1098,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "prov1".to_string(),
                     model: "gpt-4-upstream".to_string(),
+                    weight: 1,
                 },
                 VirtualModelTarget {
                     provider: "prov2".to_string(),
                     model: "gpt-4-upstream".to_string(),
+                    weight: 1,
                 },
             ],
         );
@@ -1078,6 +1112,8 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1089,6 +1125,7 @@ mod integration_tests {
         let dummy_reloader = Reloader {
             sender: _watch_sender.clone(),
             config_path: PathBuf::from("config.toml"),
+            metrics: Arc::new(RuntimeMetrics::default()),
         };
 
         let reloadable_state = ReloadableState {
@@ -1165,6 +1202,7 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov1".to_string(),
                 model: "gpt-4-upstream".to_string(),
+                weight: 1,
             }],
         );
 
@@ -1172,6 +1210,8 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client,
             upstream_timeout_secs: 5,
         });
@@ -1183,6 +1223,7 @@ mod integration_tests {
         let dummy_reloader = Reloader {
             sender: _watch_sender.clone(),
             config_path: PathBuf::from("config.toml"),
+            metrics: Arc::new(RuntimeMetrics::default()),
         };
 
         let reloadable_state = ReloadableState {
@@ -1344,10 +1385,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "p1".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
             ],
         );
@@ -1355,6 +1398,8 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1368,6 +1413,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         let router = axum::Router::new()
@@ -1472,10 +1518,12 @@ mod integration_tests {
                 VirtualModelTarget {
                     provider: "p1".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
                 VirtualModelTarget {
                     provider: "p2".into(),
                     model: "model".into(),
+                    weight: 1,
                 },
             ],
         );
@@ -1483,6 +1531,8 @@ mod integration_tests {
         let app_state = Arc::new(AppState {
             providers: vec![p1, p2],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1496,6 +1546,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         let router = axum::Router::new()
@@ -1572,12 +1623,15 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "resetme".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
 
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1591,6 +1645,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
 
@@ -1689,12 +1744,15 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "emb".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
 
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1708,6 +1766,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         let router = axum::Router::new()
@@ -1779,12 +1838,15 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov".into(),
                 model: "real-model".into(),
+                weight: 1,
             }],
         );
 
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1797,6 +1859,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         let router = axum::Router::new()
@@ -1861,11 +1924,14 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "target".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1878,6 +1944,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws.clone(),
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         let router = axum::Router::new()
@@ -1915,7 +1982,7 @@ mod integration_tests {
     #[tokio::test]
     async fn test_integration_token_count_parsed() {
         // Upstream returns a response with usage data
-        let body = r#"{"id":"test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"completion_tokens":7,"total_tokens":49}}"#;
+        let body = r#"{"id":"test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"Hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":42,"prompt_tokens_details":{"cached_tokens":10},"completion_tokens":7,"total_tokens":49}}"#;
         let ok_response = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
             body.len(),
@@ -1955,11 +2022,14 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "counter".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
         let state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vms,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -1972,6 +2042,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         let router = axum::Router::new()
@@ -1979,6 +2050,8 @@ mod integration_tests {
                 "/v1/chat/completions",
                 axum::routing::post(routes::create_chat_completions),
             )
+            .route("/status", axum::routing::get(routes::get_status))
+            .route("/dashboard", axum::routing::get(routes::dashboard))
             .layer(middleware::from_fn(add_request_id))
             .with_state(rs);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2017,6 +2090,58 @@ mod integration_tests {
         );
         assert_eq!(tokens_in, 42);
         assert_eq!(tokens_out, 7);
+
+        // Daily accounting parses cached details from the provider usage object.
+        let tokens = state.metrics.daily_tokens.snapshot();
+        assert_eq!(tokens.cached_tokens, 10);
+        assert_eq!(tokens.uncached_tokens, 32);
+        assert_eq!(tokens.total_tokens, 49);
+
+        // The request log captured this request with exactly the handoff fields
+        let log = state.metrics.recent_requests();
+        assert_eq!(log.len(), 1);
+        let entry = &log[0];
+        assert_eq!(entry.model_requested, "test");
+        assert_eq!(entry.virtual_model.as_deref(), Some("test"));
+        assert_eq!(entry.provider, "counter");
+        assert_eq!(entry.cached_tokens, 10);
+        assert_eq!(entry.uncached_tokens, 32);
+        assert_eq!(entry.status_code, 200);
+        assert!(entry.timestamp > 0);
+
+        // /status exposes the new fields (dashboard feed); /dashboard serves HTML
+        let status: Value = client
+            .get(format!("http://{}/status", proxy_addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["daily_tokens"]["total_tokens"], 49);
+        assert_eq!(status["recent_requests"][0]["model_requested"], "test");
+        assert_eq!(status["recent_requests"][0]["virtual_model"], "test");
+        assert_eq!(status["virtual_models"]["test"][0]["weight"], 1);
+
+        let page = client
+            .get(format!("http://{}/dashboard", proxy_addr))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(page.status(), 200);
+        assert!(page
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/html"));
+        let html = page.text().await.unwrap();
+        assert!(html.contains("Cached tokens"));
+        assert!(html.contains("Virtual model routing"));
+        assert!(html.contains("data.virtual_models"));
+        assert!(html.contains("target.weight"));
+        assert!(html.contains("Recent requests"));
     }
 
     // -----------------------------------------------------------------------
@@ -2048,12 +2173,15 @@ mod integration_tests {
             vec![VirtualModelTarget {
                 provider: "prov".into(),
                 model: "model".into(),
+                weight: 1,
             }],
         );
 
         let app_state = Arc::new(AppState {
             providers: vec![p],
             virtual_models: vm,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::builder().build().unwrap(),
             upstream_timeout_secs: 5,
         });
@@ -2066,6 +2194,7 @@ mod integration_tests {
             reloader: Reloader {
                 sender: _ws,
                 config_path: PathBuf::from("."),
+                metrics: Arc::new(RuntimeMetrics::default()),
             },
         };
         (app_state, rs)

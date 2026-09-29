@@ -28,12 +28,15 @@ pub struct ProviderConfig {
 pub struct VirtualModelTarget {
     pub provider: String,
     pub model: String,
+    #[serde(default = "default_virtual_model_weight")]
+    pub weight: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub server: ServerConfig,
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
     pub virtual_models: HashMap<String, Vec<VirtualModelTarget>>,
 }
 
@@ -73,6 +76,13 @@ impl Config {
             }
 
             for target in targets {
+                if target.weight == 0 {
+                    return Err(OxllmError::ConfigLoad(format!(
+                        "Virtual model '{}' target for provider '{}' must have a positive weight",
+                        vm_name, target.provider
+                    )));
+                }
+
                 match provider_map.get(target.provider.as_str()) {
                     Some(provider) => {
                         if !provider.enabled {
@@ -92,6 +102,10 @@ impl Config {
 
         Ok(())
     }
+}
+
+fn default_virtual_model_weight() -> u32 {
+    1
 }
 
 fn default_upstream_timeout() -> u64 {
@@ -148,6 +162,82 @@ pub fn expand_env_vars(raw_content: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_model_target_defaults_weight_to_one() {
+        let target: VirtualModelTarget = toml::from_str(
+            r#"provider = "provider-a"
+model = "model-a""#,
+        )
+        .unwrap();
+
+        assert_eq!(target.weight, 1);
+    }
+
+    #[test]
+    fn virtual_model_target_reads_configured_weight() {
+        let target: VirtualModelTarget = toml::from_str(
+            r#"provider = "provider-a"
+model = "model-a"
+weight = 3"#,
+        )
+        .unwrap();
+
+        assert_eq!(target.weight, 3);
+    }
+
+    #[test]
+    fn virtual_model_target_rejects_zero_weight() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = "http://127.0.0.1:4318"
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+
+            [virtual_models]
+            dual = [
+                { provider = "provider-a", model = "model-a", weight = 0 },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("positive weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_without_virtual_models_section_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = "http://127.0.0.1:4318"
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.virtual_models.is_empty());
+    }
 
     #[test]
     fn test_expand_env_vars_success() {
