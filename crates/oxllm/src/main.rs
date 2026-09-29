@@ -539,6 +539,33 @@ fn build_router(reloadable_state: ReloadableState) -> axum::Router {
         .with_state(reloadable_state)
 }
 
+/// Binds the configured IPv4 host plus a loopback listener for local tooling.
+///
+/// When the configured host is itself loopback only one listener is created,
+/// avoiding a duplicate bind on the same address.
+async fn bind_server_listeners(
+    host: IpAddr,
+    port: u16,
+) -> Result<Vec<tokio::net::TcpListener>, Box<dyn std::error::Error>> {
+    let host_addr = SocketAddr::new(host, port);
+    let host_listener = tokio::net::TcpListener::bind(host_addr).await?;
+    info!("Listening on http://{} (configured IPv4 host)", host_addr);
+
+    let host_is_loopback = host == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if host_is_loopback {
+        return Ok(vec![host_listener]);
+    }
+    let loopback_port = if port == 0 {
+        host_listener.local_addr()?.port()
+    } else {
+        port
+    };
+    let loopback_addr = SocketAddr::from(([127, 0, 0, 1], loopback_port));
+    let loopback_listener = tokio::net::TcpListener::bind(loopback_addr).await?;
+    info!("Listening on http://{} (loopback)", loopback_addr);
+    Ok(vec![host_listener, loopback_listener])
+}
+
 async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_config_path(config_path);
     // 1. Load initial config
@@ -589,25 +616,13 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // Bind all requested interfaces before serving so failures are fail-fast.
     let host: std::net::Ipv4Addr = config.server.host.parse()?;
-    let port = config.server.port;
-    let host_addr = SocketAddr::new(IpAddr::V4(host), port);
-    let host_listener = tokio::net::TcpListener::bind(host_addr).await?;
-    info!("Listening on http://{} (configured IPv4 host)", host_addr);
-
-    let loopback_listener = if host.is_loopback() {
-        None
-    } else {
-        let loopback_addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = tokio::net::TcpListener::bind(loopback_addr).await?;
-        info!("Listening on http://{} (loopback)", loopback_addr);
-        Some(listener)
-    };
+    let mut listeners = bind_server_listeners(IpAddr::V4(host), config.server.port).await?;
 
     let make_service = app
         .clone()
         .into_make_service_with_connect_info::<SocketAddr>();
-    let host_server = axum::serve(host_listener, make_service);
-    if let Some(loopback_listener) = loopback_listener {
+    let host_server = axum::serve(listeners.remove(0), make_service);
+    if let Some(loopback_listener) = listeners.pop() {
         let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
         let mut host_shutdown = shutdown_receiver.clone();
         let mut loopback_shutdown = shutdown_receiver;
@@ -2297,12 +2312,18 @@ mod integration_tests {
 
     #[tokio::test]
     async fn dual_listener_serves_configured_and_loopback_addresses() {
-        let listeners = bind_server_listeners("127.0.0.2".parse().expect("static IP"), 0)
+        let mut listeners = bind_server_listeners("127.0.0.2".parse().expect("static IP"), 0)
             .await
             .expect("loopback listeners should bind");
         assert_eq!(listeners.len(), 2);
+        let single_listener = bind_server_listeners(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
+            .await
+            .expect("localhost host should bind");
+        assert_eq!(single_listener.len(), 1);
         let host_addr = listeners[0].local_addr().expect("listener address");
         let loopback_addr = listeners[1].local_addr().expect("listener address");
+        let host_listener = listeners.remove(0);
+        let loopback_listener = listeners.remove(0);
         assert_eq!(host_addr.ip(), IpAddr::from([127, 0, 0, 2]));
         assert_eq!(loopback_addr.ip(), IpAddr::from([127, 0, 0, 1]));
         assert_eq!(host_addr.port(), loopback_addr.port());
@@ -2317,7 +2338,7 @@ mod integration_tests {
         let loopback_router = router;
         let host_task = tokio::spawn(async move {
             axum::serve(
-                listeners[0].try_clone().expect("clone host listener"),
+                host_listener,
                 host_router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(async move {
@@ -2327,7 +2348,7 @@ mod integration_tests {
         });
         let loopback_task = tokio::spawn(async move {
             axum::serve(
-                listeners[1].try_clone().expect("clone loopback listener"),
+                loopback_listener,
                 loopback_router.into_make_service_with_connect_info::<SocketAddr>(),
             )
             .with_graceful_shutdown(async move {

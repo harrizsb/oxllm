@@ -21,7 +21,7 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
-* **Dual-Stack IPv4/IPv6**: Configurable via `bind_family`: `"ipv4"` (default), `"ipv6"`, or `"dual"` for both.
+* **Tailscale-Ready Binding**: Binds the configured IPv4 `host` plus a loopback listener so local CLI tools keep working; `bind_family` is retained only for config compatibility and must stay `"ipv4"`.
 * **Unix-Style Environment Expansion**: Shell-style `${VAR}` replacement in TOML config values.
 * **Musl Cross-Compilation**: Pure-Rust `rustls-tls` stack avoids native OpenSSL linking on edge routers.
 * **OpenAI SDK Compatible** — JSON error format, CORS headers, and `x-request-id`
@@ -164,11 +164,11 @@ oxllm serve --config config-local-test.toml
 
 | Field | Default | Description |
 |---|---|---|
-| `host` | `"127.0.0.1"` | Bind address (not used when `bind_family` is `ipv6`/`dual`) |
+| `host` | `"127.0.0.1"` | Literal IPv4 address to bind (wildcard `0.0.0.0` and IPv6 addresses are rejected) |
 | `port` | `8080` | Listen port |
 | `otel_endpoint` | — | OTLP HTTP endpoint (e.g. `http://127.0.0.1:4318`). If unreachable, proxy starts without telemetry. Records spans with GenAI semantic attributes, 3 metrics (provider status gauge, request duration histogram, token counter), and W3C trace context propagation. See [architecture docs](docs/architecture.md#4-telemetry-layer--trace-context-propagation). |
 | `upstream_timeout_secs` | `5` | Upstream request timeout in seconds |
-| `bind_family` | `"ipv4"` | Address family: `"ipv4"`, `"ipv6"`, or `"dual"` (both) |
+| `bind_family` | `"ipv4"` | Legacy field kept for config compatibility; must be `"ipv4"` — `"ipv6"`/`"dual"` fail validation with a migration hint |
 
 ### Provider Definition
 
