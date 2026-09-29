@@ -170,11 +170,21 @@ impl ReloadIo {
             let bytes = bytes.to_vec();
             move || {
                 use std::io::Write;
-                let mut file = std::fs::File::create(&path)
-                    .map_err(|e| format!("failed to create temp file {}: {}", path.display(), e))?;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                if let Some(perms) = permissions.as_ref() {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    use std::os::unix::fs::PermissionsExt;
+                    options.mode(perms.mode() & 0o777);
+                }
+                let mut file = options.open(&path).map_err(|error| {
+                    format!("failed to create temp file {}: {}", path.display(), error)
+                })?;
                 if let Some(perms) = permissions {
-                    file.set_permissions(perms)
-                        .map_err(|e| format!("failed to set temp file permissions: {}", e))?;
+                    file.set_permissions(perms).map_err(|error| {
+                        format!("failed to set temp file permissions: {}", error)
+                    })?;
                 }
                 file.write_all(&bytes)
                     .map_err(|e| format!("failed to write temp file: {}", e))?;

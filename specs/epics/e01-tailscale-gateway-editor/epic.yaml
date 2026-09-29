@@ -2,12 +2,12 @@ id: e01
 title: Tailscale-only gateway with dashboard config editor
 wsjf: 4.8
 total_bcps: 16
-status: in_progress
+status: done
 stories:
 - id: e01s01
   title: 'Tailnet reachability: dual bind + tailnet/loopback guard on all routes'
   bcps: 5
-  status: todo
+  status: done
   spec: e01s01-tailnet-reachability.md
   tasks: e01s01-tasks.yaml
   delta:
@@ -26,7 +26,7 @@ stories:
 - id: e01s02
   title: Raw config view + Validate dry-run on the dashboard
   bcps: 5
-  status: todo
+  status: done
   spec: e01s02-raw-config-validate.md
   tasks: e01s02-tasks.yaml
   delta:
@@ -54,7 +54,7 @@ stories:
 - id: e01s03
   title: 'Apply: one-generation backup, atomic swap, in-process reload'
   bcps: 6
-  status: todo
+  status: done
   spec: e01s03-apply-pipeline.md
   tasks: e01s03-tasks.yaml
   delta:

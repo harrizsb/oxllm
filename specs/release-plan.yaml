@@ -2,7 +2,7 @@
 release:
   version: "mirror-only"      # non-authoritative; semantic-release decides at merge
   codename: "tailscale-gateway-and-dashboard-config-editor"
-  status: planning
+  status: ready_for_release
   semantic_release: true
   bump_hint: minor
 epics:
