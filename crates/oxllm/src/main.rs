@@ -551,8 +551,10 @@ async fn bind_server_listeners(
     let host_listener = tokio::net::TcpListener::bind(host_addr).await?;
     info!("Listening on http://{} (configured IPv4 host)", host_addr);
 
-    let host_is_loopback = host == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
-    if host_is_loopback {
+    // Only 127.0.0.1 itself is skipped; other 127/8 hosts still get the
+    // dedicated loopback listener so local tooling can keep using 127.0.0.1.
+    let host_is_dedicated_loopback = host == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if host_is_dedicated_loopback {
         return Ok(vec![host_listener]);
     }
     let loopback_port = if port == 0 {
@@ -609,14 +611,14 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     let app = build_router(reloadable_state);
 
+    // Bind all requested interfaces before serving so failures are fail-fast.
+    let host: std::net::Ipv4Addr = config.server.host.parse()?;
+    let mut listeners = bind_server_listeners(IpAddr::V4(host), config.server.port).await?;
+
     // Write PID file
     if let Err(e) = write_pid_file() {
         warn!("Failed to write PID file: {}", e);
     }
-
-    // Bind all requested interfaces before serving so failures are fail-fast.
-    let host: std::net::Ipv4Addr = config.server.host.parse()?;
-    let mut listeners = bind_server_listeners(IpAddr::V4(host), config.server.port).await?;
 
     let make_service = app
         .clone()
@@ -2282,9 +2284,10 @@ mod integration_tests {
             .await
             .expect("loopback listeners should bind");
         assert_eq!(listeners.len(), 2);
-        let single_listener = bind_server_listeners(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0)
-            .await
-            .expect("localhost host should bind");
+        let single_listener =
+            bind_server_listeners(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0)
+                .await
+                .expect("localhost host should bind");
         assert_eq!(single_listener.len(), 1);
         let host_addr = listeners[0].local_addr().expect("listener address");
         let loopback_addr = listeners[1].local_addr().expect("listener address");
@@ -2362,6 +2365,8 @@ mod integration_tests {
                 axum::http::Method::POST,
                 "/admin/providers/provider/offline",
             ),
+            (axum::http::Method::POST, "/admin/providers/provider/online"),
+            (axum::http::Method::POST, "/admin/providers/provider/reset"),
             (axum::http::Method::POST, "/v1/embeddings"),
         ] {
             let response = router
@@ -2391,7 +2396,10 @@ mod integration_tests {
                 axum::http::Method::POST,
                 "/admin/providers/provider/offline",
             ),
+            (axum::http::Method::POST, "/admin/providers/provider/online"),
+            (axum::http::Method::POST, "/admin/providers/provider/reset"),
             (axum::http::Method::POST, "/v1/chat/completions"),
+            (axum::http::Method::POST, "/v1/embeddings"),
         ] {
             let response = router
                 .clone()
@@ -2415,6 +2423,18 @@ mod integration_tests {
                 response.headers().get(header::CONTENT_TYPE),
                 Some(&HeaderValue::from_static("application/json")),
                 "403 on {uri} is not JSON"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("denial body must be readable");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("denial body must be JSON");
+            assert_eq!(body["error"]["code"], 403, "403 on {uri} has wrong code");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Access denied")),
+                "403 on {uri} has wrong message: {body}"
             );
         }
     }
