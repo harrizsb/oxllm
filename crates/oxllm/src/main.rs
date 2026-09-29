@@ -292,6 +292,19 @@ async fn add_request_id(mut req: Request<Body>, next: Next) -> Response {
     response
 }
 
+fn is_tailnet_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            ipv4.is_loopback() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        },
+        IpAddr::V6(ipv6) => match ipv6.to_ipv4_mapped() {
+            Some(ipv4) => is_tailnet_or_loopback(IpAddr::V4(ipv4)),
+            None => ipv6.is_loopback(),
+        },
+    }
+}
+
 async fn localhost_only(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
