@@ -121,6 +121,7 @@ pub async fn list_models(State(app_state): State<Arc<AppState>>) -> impl IntoRes
 struct RouteEntry {
     provider: String,
     model: String,
+    weight: u32,
     circuit: String,
     requests: u64,
     successes: u64,
@@ -257,6 +258,7 @@ pub async fn get_status(
             entries.push(RouteEntry {
                 provider: target.provider.clone(),
                 model: target.model.clone(),
+                weight: target.weight,
                 circuit: circuit_str,
                 requests,
                 successes,

@@ -25,6 +25,9 @@ th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overf
 <div class="card">Uncached tokens<strong id="uncached">—</strong></div>
 <div class="card">Total tokens<strong id="total">—</strong></div>
 </section>
+<h2>Virtual model routing</h2>
+<p class="muted">Configured targets, SWRR weights, provider circuit health, and aggregate provider activity.</p>
+<div id="virtual-models"><p class="muted">Loading…</p></div>
 <h2>Recent requests</h2>
 <table>
 <thead><tr><th>Time</th><th>Requested model</th><th>Provider</th><th>Cached</th><th>Uncached</th><th>Status</th></tr></thead>
@@ -40,6 +43,37 @@ async function refresh() {
   document.querySelector('#cached').textContent = number(data.daily_tokens.cached_tokens);
   document.querySelector('#uncached').textContent = number(data.daily_tokens.uncached_tokens);
   document.querySelector('#total').textContent = number(data.daily_tokens.total_tokens);
+  const virtualModels = document.querySelector('#virtual-models');
+  virtualModels.replaceChildren();
+  const modelNames = Object.keys(data.virtual_models).sort();
+  if (!modelNames.length) {
+    const empty = document.createElement('p');
+    empty.className = 'muted';
+    empty.textContent = 'No virtual models configured';
+    virtualModels.append(empty);
+  }
+  for (const name of modelNames) {
+    const heading = document.createElement('h3');
+    heading.textContent = name;
+    virtualModels.append(heading);
+    const table = document.createElement('table');
+    const thead = table.createTHead();
+    const headerRow = thead.insertRow();
+    for (const label of ['Provider', 'Upstream model', 'Weight', 'Circuit', 'Requests', 'Successes']) {
+      const cell = document.createElement('th');
+      cell.textContent = label;
+      headerRow.append(cell);
+    }
+    const tbody = table.createTBody();
+    for (const target of data.virtual_models[name]) {
+      const row = tbody.insertRow();
+      for (const value of [target.provider, target.model, target.weight, target.circuit,
+        number(target.requests), number(target.successes)]) {
+        row.insertCell().textContent = value;
+      }
+    }
+    virtualModels.append(table);
+  }
   const body = document.querySelector('#requests');
   body.replaceChildren();
   if (!data.recent_requests.length) {

@@ -2121,6 +2121,7 @@ mod integration_tests {
         assert_eq!(status["daily_tokens"]["total_tokens"], 49);
         assert_eq!(status["recent_requests"][0]["model_requested"], "test");
         assert_eq!(status["recent_requests"][0]["virtual_model"], "test");
+        assert_eq!(status["virtual_models"]["test"][0]["weight"], 1);
 
         let page = client
             .get(format!("http://{}/dashboard", proxy_addr))
@@ -2138,6 +2139,8 @@ mod integration_tests {
         let html = page.text().await.unwrap();
         assert!(html.contains("Cached tokens"));
         assert!(html.contains("Virtual model routing"));
+        assert!(html.contains("data.virtual_models"));
+        assert!(html.contains("target.weight"));
         assert!(html.contains("Recent requests"));
     }
 
