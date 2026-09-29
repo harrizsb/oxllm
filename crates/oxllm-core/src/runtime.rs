@@ -116,6 +116,7 @@ impl DailyTokenAccounting {
         }
     }
 
+    #[cfg(test)]
     pub fn snapshot_on_day(&self, day: u64) -> DailyTokenSnapshot {
         self.ensure_day(day);
         loop {

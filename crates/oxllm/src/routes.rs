@@ -575,6 +575,7 @@ pub async fn create_embeddings(
                     "Embedding request upstream {} connection failed: {}",
                     selected.name, e
                 );
+                last_failed_provider = selected.name.clone();
                 let target_provider_state = app_state
                     .providers
                     .iter()
@@ -1012,6 +1013,7 @@ pub async fn create_chat_completions(
                     "Chat completions upstream {} connection failed: {}",
                     selected.name, e
                 );
+                last_failed_provider = selected.name.clone();
                 let target_provider_state = app_state
                     .providers
                     .iter()
