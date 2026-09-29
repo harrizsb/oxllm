@@ -370,4 +370,43 @@ weight = 3"#,
         let result = expand_env_vars(input);
         assert!(matches!(result, Err(OxllmError::ConfigLoad(_))));
     }
+
+    #[test]
+    fn unknown_fields_are_rejected_with_field_name_at_every_config_level() {
+        let header = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318""#;
+        let provider = r#"[[providers]]
+name = "p"
+enabled = true
+base_url = "https://example.com"
+api_key = "key"
+models = ["m"]"#;
+        let cases = [
+            (format!("{header}\nserver_typo = true\n\n{provider}"), "server_typo"),
+            (format!("{header}\n\n{provider}\nprovider_typo = true"), "provider_typo"),
+            (
+                format!(
+                    "{header}\n\n{provider}\n\n[virtual_models]\nvm = [{{ provider = \"p\", model = \"m\", target_typo = true }}]"
+                ),
+                "target_typo",
+            ),
+            (format!("{header}\n\n{provider}\n\nroot_typo = true"), "root_typo"),
+        ];
+        for (raw, field) in cases {
+            let error = toml::from_str::<Config>(&raw).expect_err("unknown field must fail");
+            assert!(error.to_string().contains(field), "{field}: {error}");
+        }
+    }
+
+    #[test]
+    fn validate_rejects_malformed_enabled_provider_url() {
+        let config = valid_config_with_host("127.0.0.1", "ipv4");
+        // Replacing after parse isolates validation behavior from TOML syntax.
+        let mut config = config;
+        config.providers[0].base_url = "file:///etc/passwd".to_string();
+        let error = config.validate().expect_err("non-http scheme must fail");
+        assert!(error.to_string().contains("http or https"), "{error}");
+    }
 }
