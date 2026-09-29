@@ -587,58 +587,69 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         warn!("Failed to write PID file: {}", e);
     }
 
-    // Start listening
+    // Bind all requested interfaces before serving so failures are fail-fast.
+    let host: std::net::Ipv4Addr = config.server.host.parse()?;
     let port = config.server.port;
-    let listener = match config.server.bind_family.as_str() {
-        "ipv6" => {
-            let addr = format!("[::]:{}", port);
-            info!("Listening on http://{} (IPv6 only)", addr);
-            tokio::net::TcpListener::bind(&addr).await?
-        },
-        "dual" => {
-            let addr = std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                port,
-            );
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV6,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )
-            .map_err(|e| format!("Failed to create socket: {}", e))?;
-            socket
-                .set_only_v6(false)
-                .map_err(|e| format!("Failed to set dual-stack: {}", e))?;
-            socket
-                .set_reuse_address(true)
-                .map_err(|e| format!("Failed to set reuse address: {}", e))?;
-            socket
-                .bind(&addr.into())
-                .map_err(|e| format!("Failed to bind: {}", e))?;
-            socket
-                .listen(1024)
-                .map_err(|e| format!("Failed to listen: {}", e))?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
-            info!("Listening on [::]:{} (dual-stack IPv4/IPv6)", port);
-            tokio::net::TcpListener::from_std(socket.into())
-                .map_err(|e| format!("Failed to create tokio listener: {}", e))?
-        },
-        _ => {
-            // Default: IPv4
-            let addr = format!("{}:{}", config.server.host, port);
-            info!("Listening on http://{} (IPv4)", addr);
-            tokio::net::TcpListener::bind(&addr).await?
-        },
+    let host_addr = SocketAddr::new(IpAddr::V4(host), port);
+    let host_listener = tokio::net::TcpListener::bind(host_addr).await?;
+    info!("Listening on http://{} (configured IPv4 host)", host_addr);
+
+    let loopback_listener = if host.is_loopback() {
+        None
+    } else {
+        let loopback_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let listener = tokio::net::TcpListener::bind(loopback_addr).await?;
+        info!("Listening on http://{} (loopback)", loopback_addr);
+        Some(listener)
     };
 
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let make_service = app
+        .clone()
+        .into_make_service_with_connect_info::<SocketAddr>();
+    let host_server = axum::serve(host_listener, make_service);
+    if let Some(loopback_listener) = loopback_listener {
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let mut host_shutdown = shutdown_receiver.clone();
+        let mut loopback_shutdown = shutdown_receiver;
+        let loopback_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let mut host_handle = tokio::spawn(async move {
+            host_server
+                .with_graceful_shutdown(async move {
+                    let _ = host_shutdown.changed().await;
+                })
+                .await
+        });
+        let mut loopback_handle = tokio::spawn(async move {
+            axum::serve(loopback_listener, loopback_service)
+                .with_graceful_shutdown(async move {
+                    let _ = loopback_shutdown.changed().await;
+                })
+                .await
+        });
+        tokio::select! {
+            result = &mut host_handle => {
+                let _ = shutdown_sender.send(true);
+                let loopback_result = loopback_handle.await?;
+                result??;
+                loopback_result?;
+            },
+            result = &mut loopback_handle => {
+                let _ = shutdown_sender.send(true);
+                let host_result = host_handle.await?;
+                result??;
+                host_result?;
+            },
+            _ = shutdown_signal() => {
+                let _ = shutdown_sender.send(true);
+                host_handle.await??;
+                loopback_handle.await??;
+            },
+        }
+    } else {
+        host_server
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
 
     Ok(())
 }
@@ -2282,6 +2293,67 @@ mod integration_tests {
             .extensions_mut()
             .insert(ConnectInfo(SocketAddr::new(peer, 0)));
         request
+    }
+
+    #[tokio::test]
+    async fn dual_listener_serves_configured_and_loopback_addresses() {
+        let listeners = bind_server_listeners("127.0.0.2".parse().expect("static IP"), 0)
+            .await
+            .expect("loopback listeners should bind");
+        assert_eq!(listeners.len(), 2);
+        let host_addr = listeners[0].local_addr().expect("listener address");
+        let loopback_addr = listeners[1].local_addr().expect("listener address");
+        assert_eq!(host_addr.ip(), IpAddr::from([127, 0, 0, 2]));
+        assert_eq!(loopback_addr.ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(host_addr.port(), loopback_addr.port());
+
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_state, reloadable_state) = build_test_state(upstream);
+        let router = build_router(reloadable_state);
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let mut shutdown_host = shutdown_receiver.clone();
+        let mut shutdown_loopback = shutdown_receiver;
+        let host_router = router.clone();
+        let loopback_router = router;
+        let host_task = tokio::spawn(async move {
+            axum::serve(
+                listeners[0].try_clone().expect("clone host listener"),
+                host_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_host.changed().await;
+            })
+            .await
+        });
+        let loopback_task = tokio::spawn(async move {
+            axum::serve(
+                listeners[1].try_clone().expect("clone loopback listener"),
+                loopback_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_loopback.changed().await;
+            })
+            .await
+        });
+
+        let client = reqwest::Client::new();
+        for address in [host_addr, loopback_addr] {
+            let response = client
+                .get(format!("http://{address}/health"))
+                .send()
+                .await
+                .expect("health request should connect");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let _ = shutdown_sender.send(true);
+        host_task
+            .await
+            .expect("host server task")
+            .expect("host server");
+        loopback_task
+            .await
+            .expect("loopback server task")
+            .expect("loopback server");
     }
 
     #[tokio::test]
