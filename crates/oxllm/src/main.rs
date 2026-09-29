@@ -2137,6 +2137,7 @@ mod integration_tests {
             .starts_with("text/html"));
         let html = page.text().await.unwrap();
         assert!(html.contains("Cached tokens"));
+        assert!(html.contains("Virtual model routing"));
         assert!(html.contains("Recent requests"));
     }
 
