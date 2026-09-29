@@ -1,0 +1,80 @@
+story_id: e01s01
+title: 'Tailnet reachability: dual bind + tailnet/loopback guard on all routes'
+status: done
+bcps: 5
+tasks:
+- id: 1
+  description: Extract a route-building function accepting ReloadableState so run_serve
+    and tests use one router; remove all per-route localhost_only layers and attach
+    tailnet_only at router level with ordering that preserves x-request-id on denials
+  verify: cargo test -p oxllm router_builds_and_guards_all_routes
+  risk: P0
+  status: passing
+  security: high
+  allure:
+    severity: critical
+    categories: &id001
+    - Security Review
+    - unit
+    - integration
+- id: 2
+  description: 'Implement a pure source-IP decision function: allow IPv4/IPv6 loopback
+    and IPv4-mapped loopback; allow canonical IPv4 100.64.0.0/10; reject all others
+    (tailnet IPv6 ULA excluded by user decision); 403 JSON with no unwrap/expect in
+    the denial path'
+  verify: cargo test -p oxllm router_builds_and_guards_all_routes
+  risk: P0
+  status: passing
+  security: high
+  allure:
+    severity: critical
+    categories: *id001
+- id: 3
+  description: 'Apply the guard to every production route including all /v1 routes;
+    add decision-matrix unit tests: 127.0.0.1, ::1, ::ffff:127.0.0.1, 100.64.0.1,
+    100.127.255.254 allowed; 8.8.8.8, 192.168.1.10, 100.0.0.1, 100.128.0.0, 2001:db8::1
+    rejected'
+  verify: cargo test -p oxllm router_builds_and_guards_all_routes
+  risk: P0
+  status: passing
+  security: high
+  allure:
+    severity: critical
+    categories: *id001
+- id: 4
+  description: 'Make [server].host authoritative: validate it parses as a non-unspecified
+    IPv4 literal IP (reject IPv6; no IPv6 listener); accept only bind_family=ipv4
+    and fail ipv6/dual with a migration diagnostic (remove bind_family, set host);
+    bind host:port plus 127.0.0.1:port (one socket if host is loopback); remove socket2
+    from root workspace, oxllm crate, and unused oxllm-core manifest; update README
+    config table'
+  verify: cargo test -p oxllm-core validate_ && cargo check --workspace
+  risk: P0
+  status: passing
+  security: medium
+  allure:
+    severity: critical
+    categories: *id001
+- id: 5
+  description: Serve one router on both listeners via tokio::select! with a single
+    shared shutdown trigger; integration test on 127.0.0.1:0 asserting /health, /status,
+    /dashboard, /reload, /admin/*, /v1/models all answer without auth headers, plus
+    403 shape on denial
+  verify: cargo test -p oxllm dual_listener
+  risk: P0
+  status: passing
+  security: high
+  allure:
+    severity: critical
+    categories: *id001
+- id: 6
+  description: Run all repo gates and size check
+  verify: cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+    && cargo test --workspace && cargo build --release && [ "$(stat -c %s target/release/oxllm)"
+    -lt 15728640 ]
+  risk: P0
+  status: passing
+  security: high
+  allure:
+    severity: critical
+    categories: *id001

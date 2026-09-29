@@ -213,8 +213,8 @@ The binary supports clean POSIX subcommands for daemon management and operationa
 * `oxllm stop` (Gracefully stops the daemon via SIGTERM — drains in-flight SSE streams before exiting)
 * `oxllm reload` (Finds the running `oxllm` daemon process and triggers SIGHUP immediately, or use `POST /reload` HTTP endpoint)
 
-### 5.2. Admin Route Protection
-To prevent external network actors from auditing provider credentials or configurations, all administrative endpoints (like `/status`, `/health`, `/reload`, and `/admin/providers/*`) are **localhost-restricted**. The `localhost_only` middleware accepts both IPv4 loopback (`127.0.0.1`) and IPv6-mapped IPv4 addresses (e.g., `::ffff:127.0.0.1`, added in v0.1.8). External callers receive an immediate `403 Forbidden`.
+### 5.2. Tailnet Route Protection
+The server binds the configured literal IPv4 `server.host` and, when that is not loopback, an additional `127.0.0.1` listener. A router-level `tailnet_only` middleware protects **all routes**, including `/v1/*`, status, dashboard, health, reload, and provider administration. It permits loopback and IPv4 source addresses in `100.64.0.0/10`; other sources receive a JSON `403 Forbidden`. The CGNAT range is not proof of Tailscale device identity: the bind address, host firewall, and tailnet ACLs remain the security boundary. This deployment intentionally excludes Tailscale IPv6 addresses. No application-layer authentication is provided.
 
 ### 5.3. Cross-Origin Resource Sharing (CORS)
 All public endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) return

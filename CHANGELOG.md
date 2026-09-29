@@ -8,18 +8,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Virtual models with weighted routing**: `[virtual_models]` config section maps a client-facing
-  model name to provider targets with optional `weight` (default 1). Targets are picked with
-  smooth weighted round-robin; the remaining targets stay ordered as fallbacks. Virtual model
-  names shadow provider models with a startup warning.
-- **Daily token accounting**: cached / uncached / total token counters sourced from the provider
-  `usage` field, reset at the UTC day boundary via lock-free compare-and-swap rollover.
-- **Last-3 request log**: in-memory ring buffer of the three most recent requests (model,
-  virtual model, provider, cached/uncached tokens, status).
-- **Read-only dashboard**: `GET /dashboard` (localhost only) shows today's token totals, the
-  virtual-model routing table (targets, weights, circuit state, request counts), and the recent
-  requests; fed by the extended `/status` payload. Embedded at compile time via `include_str!`,
-  no build step.
+- **Tailnet-only gateway boundary**: requests are only accepted from loopback or the Tailscale
+  IPv4 CGNAT range (`100.64.0.0/10`); everything else, including `/v1/*`, gets a JSON 403 that
+  preserves the request ID. The configured bind must be a specific IPv4 address (wildcard
+  `0.0.0.0` and IPv6 are rejected at validation); oxllm binds the configured address plus
+  `127.0.0.1` so local tooling keeps working.
+- **Raw config editor endpoints**: `GET /config` serves the exact `config.toml` bytes with
+  `${VAR}` placeholders preserved (`Cache-Control: no-store`); `POST /validate` runs the full
+  parse → expand → validate → `build_app_state` pipeline in memory as a dry run with zero writes,
+  returning diagnostics (TOML line/col when available, marked approximate when expansion shifts
+  offsets).
+- **Apply pipeline** (`POST /apply`): one shared serialization lock covers HTTP reload, SIGHUP
+  reload, and Apply. Apply validates and builds the new state BEFORE any write, then stages the
+  new config and the one-generation `config.toml.bak` (exact old bytes, same permissions) in the
+  same directory, fsyncs, renames them into place, syncs the parent directory, and publishes the
+  prebuilt state. Any pre-commit failure leaves `config.toml`, `.bak`, and the live state
+  untouched; a commit or publish failure restores the previous bytes atomically and reports
+  rollback failures distinctly. Response lists `restart_required` for startup-bound fields
+  (`server.host`, `server.port`, `server.otel_endpoint`).
+- **Dashboard configuration editor**: raw TOML textarea with Load, Validate (dry-run), and Apply
+  (confirmation dialog, busy-state disable) using safe `textContent` rendering for diagnostics.
+
+### Security
+- **Editor endpoints reject cross-origin browsers**: `GET /config`, `POST /validate`, and
+  `POST /apply` reject a present cross-origin `Origin` header (including `null`, malformed, and
+  duplicate values); requests without an `Origin` header remain allowed for non-browser clients.
+  This blocks browser-based reads/writes of raw config secrets from unrelated web pages; it is
+  explicitly NOT authentication — the tailnet boundary is.
+- **Strict config schema**: unknown fields are rejected (`deny_unknown_fields`) on server,
+  provider, and virtual-model target sections; malformed enabled-provider URLs and invalid bind
+  hosts fail validation before the server starts or before Apply writes anything.
+
+### Changed
+- **Reload semantics made explicit**: daily token counters and the last-3 request log persist
+  across reload/apply (shared `RuntimeMetrics`); provider request counters, circuit state,
+  admin-disabled flags, and SWRR cursors reset on every reload/apply; `server.host`,
+  `server.port`, and `server.otel_endpoint` are startup-bound — they save to disk but only take
+  effect after a service restart.
 
 ## [0.1.12] - 2026-06-01
 

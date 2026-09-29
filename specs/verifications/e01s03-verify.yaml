@@ -1,0 +1,42 @@
+story_id: e01s03
+verified_at: "2026-09-29T15:20:00Z"
+verifier: verify-work
+phases:
+  smoke:
+    passed: true
+    details: "Cold-start release server smoke on localhost verified /health, /config, valid /apply with .bak creation, and invalid /apply rejection."
+  build:
+    passed: true
+    command: "cargo build --release -p oxllm"
+  typecheck:
+    passed: true
+    command: "cargo check --workspace --all-targets"
+  lint:
+    passed: true
+    command: "cargo clippy --workspace --all-targets -- -D warnings"
+  tests:
+    passed: true
+    command: "cargo test --workspace"
+    passed_tests: 69
+    failed_tests: 0
+  terminal_verdict:
+    command: "cargo test --workspace"
+    exit_code: 0
+    captured_at: "2026-09-29T15:17:31Z"
+    note: "Single contiguous run, workspace clean exit (38 oxllm, 30 oxllm-core, 1 bench)"
+  manual:
+    steps:
+      - step: "POST /apply valid candidate"
+        expected: "Applied true, .bak holds exact prior bytes, /status reflects new models, metrics continuous"
+        actual: "Applied true, exact .bak verified by diff, metrics intact"
+        passed: true
+      - step: "POST /apply invalid syntax"
+        expected: "400 with diagnostics, zero bytes written to config.toml or .bak"
+        actual: "400 returned, config and .bak untouched"
+        passed: true
+      - step: "POST /apply cross-origin browser"
+        expected: "403 Forbidden before write"
+        actual: "403 returned, zero writes"
+        passed: true
+  gaps:
+    closed: true

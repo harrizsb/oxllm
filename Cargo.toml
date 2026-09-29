@@ -18,7 +18,7 @@ homepage = "https://github.com/planetf1/oxllm"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "0.8"
+toml = { version = "0.8" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 bytes = "1"
 thiserror = "2"
@@ -34,7 +34,6 @@ opentelemetry = { version = "0.28", features = ["trace", "metrics"] }
 opentelemetry_sdk = { version = "0.28", features = ["trace", "metrics", "rt-tokio"] }
 opentelemetry-otlp = { version = "0.28", default-features = false, features = ["http-json", "reqwest-rustls"] }
 opentelemetry-semantic-conventions = "0.28"
-socket2 = "0.5"
 rand = "0.9"
 
 [profile.release]

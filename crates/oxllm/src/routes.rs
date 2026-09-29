@@ -1139,7 +1139,7 @@ fn json_error_response(message: &str, error_type: &str, status: StatusCode) -> R
 }
 
 // ---------------------------------------------------------------------------
-// Admin handlers — must be mounted behind localhost_only middleware
+// Admin handlers — must be mounted behind the router-level tailnet_only middleware
 // ---------------------------------------------------------------------------
 
 /// POST /admin/providers/{name}/offline

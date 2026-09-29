@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -18,6 +18,8 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use oxllm_core::config::Config;
+#[cfg(test)]
+use oxllm_core::runtime::RequestLogEntry;
 use oxllm_core::runtime::RuntimeMetrics;
 use oxllm_core::state::{AppState, CircuitState, ProviderState};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
@@ -140,11 +142,89 @@ enum ProviderCommand {
     },
 }
 
+/// Filesystem operations used by the Apply pipeline. Injected so tests can
+/// stage deterministic write/sync/rename/rollback failures (story e01s03).
+#[derive(Clone, Default)]
+pub struct ReloadIo {
+    /// When Some, the temp-file flush+sync step returns this error.
+    pub fail_sync: Option<String>,
+    /// When Some, every rename returns this error.
+    pub fail_rename: Option<String>,
+    /// When Some, only this 1-based rename call returns the injected error.
+    pub fail_rename_on_call: Option<u64>,
+    rename_calls: Arc<AtomicU64>,
+}
+
+impl ReloadIo {
+    async fn write_tmp_and_sync(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        permissions: Option<std::fs::Permissions>,
+    ) -> std::result::Result<(), String> {
+        if let Some(message) = &self.fail_sync {
+            return Err(message.clone());
+        }
+        tokio::task::spawn_blocking({
+            let path = path.to_path_buf();
+            let bytes = bytes.to_vec();
+            move || {
+                use std::io::Write;
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                if let Some(perms) = permissions.as_ref() {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    use std::os::unix::fs::PermissionsExt;
+                    options.mode(perms.mode() & 0o777);
+                }
+                let mut file = options.open(&path).map_err(|error| {
+                    format!("failed to create temp file {}: {}", path.display(), error)
+                })?;
+                if let Some(perms) = permissions {
+                    file.set_permissions(perms).map_err(|error| {
+                        format!("failed to set temp file permissions: {}", error)
+                    })?;
+                }
+                file.write_all(&bytes)
+                    .map_err(|e| format!("failed to write temp file: {}", e))?;
+                file.sync_all()
+                    .map_err(|e| format!("failed to sync temp file: {}", e))?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| format!("temp write task failed: {}", e))?
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> std::result::Result<(), String> {
+        let call = self.rename_calls.fetch_add(1, Ordering::Relaxed) + 1;
+        if let Some(message) = &self.fail_rename {
+            return Err(message.clone());
+        }
+        if self.fail_rename_on_call == Some(call) {
+            return Err(format!("injected rename failure at call {call}"));
+        }
+        tokio::fs::rename(from, to).await.map_err(|e| {
+            format!(
+                "failed to rename {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            )
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Reloader {
     sender: tokio::sync::watch::Sender<Arc<AppState>>,
     config_path: PathBuf,
     metrics: Arc<RuntimeMetrics>,
+    /// Serializes HTTP reload, SIGHUP reload, and Apply (story e01s03).
+    pub reload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Injectable filesystem operations for the Apply pipeline.
+    pub io: ReloadIo,
 }
 
 #[derive(Clone)]
@@ -292,38 +372,43 @@ async fn add_request_id(mut req: Request<Body>, next: Next) -> Response {
     response
 }
 
-async fn localhost_only(
+fn is_tailnet_or_loopback(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            ipv4.is_loopback() || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+        },
+        IpAddr::V6(ipv6) => match ipv6.to_ipv4_mapped() {
+            Some(ipv4) => is_tailnet_or_loopback(IpAddr::V4(ipv4)),
+            None => ipv6.is_loopback(),
+        },
+    }
+}
+
+async fn tailnet_only(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let is_local = match addr.ip() {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        // Dual-stack bindings present IPv4 connections as IPv4-mapped IPv6
-        // addresses like ::ffff:127.0.0.1. to_canonical() converts these to
-        // their IPv4 representation so is_loopback() works correctly.
-        IpAddr::V6(v6) => v6.is_loopback() || v6.to_canonical().is_loopback(),
-    };
-    if is_local {
-        next.run(req).await
-    } else {
-        warn!(target: "oxllm::security", "Blocked external attempt to access administrative route from IP: {}", addr.ip());
-        let body = serde_json::json!({
-            "error": {
-                "message": "Access denied: administrative routes are localhost-only",
-                "type": "forbidden",
-                "code": 403
-            }
-        });
-        let bytes = serde_json::to_vec(&body).unwrap();
-        let mut response = Response::new(Body::from(bytes));
-        *response.status_mut() = StatusCode::FORBIDDEN;
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
-        response
+    if is_tailnet_or_loopback(addr.ip()) {
+        return next.run(req).await;
     }
+
+    warn!(target: "oxllm::security", peer = %addr.ip(), "Blocked request from outside loopback and tailnet source ranges");
+    let body = serde_json::json!({
+        "error": {
+            "message": "Access denied: source is outside the permitted tailnet and loopback ranges",
+            "type": "forbidden",
+            "code": 403
+        }
+    });
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
 }
 
 async fn health_check() -> impl IntoResponse {
@@ -361,9 +446,243 @@ async fn shutdown_signal() {
     let _ = std::fs::remove_file("/tmp/oxllm.pid");
 }
 
+struct CandidateConfig {
+    raw: String,
+    config: Config,
+    state: AppState,
+}
+
+#[derive(Debug)]
+struct CandidateError {
+    message: String,
+    line: Option<usize>,
+    col: Option<usize>,
+}
+
+impl std::fmt::Display for CandidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn build_config_candidate(
+    raw: String,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<CandidateConfig, CandidateError> {
+    let expanded = oxllm_core::config::expand_env_vars(&raw).map_err(|error| CandidateError {
+        message: error.to_string(),
+        line: None,
+        col: None,
+    })?;
+    let config: Config = toml::from_str(&expanded).map_err(|error: toml::de::Error| {
+        let approximate = expanded != raw;
+        let suffix = if approximate {
+            " (location is approximate because ${VAR} placeholders were expanded)"
+        } else {
+            ""
+        };
+        let (line, col) = error.span().map_or((None, None), |span| {
+            let prefix = &expanded[..span.start.min(expanded.len())];
+            (
+                Some(prefix.lines().count().max(1)),
+                Some(prefix.lines().last().map_or(1, |line| line.len() + 1)),
+            )
+        });
+        CandidateError {
+            message: format!("{error}{suffix}"),
+            line,
+            col,
+        }
+    })?;
+    config.validate().map_err(|error| CandidateError {
+        message: error.to_string(),
+        line: None,
+        col: None,
+    })?;
+    let state = build_app_state(config.clone(), metrics).map_err(|message| CandidateError {
+        message,
+        line: None,
+        col: None,
+    })?;
+    Ok(CandidateConfig { raw, config, state })
+}
+
+static APPLY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn sibling_temp_path(path: &Path, label: &str) -> PathBuf {
+    let id = APPLY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    path.with_file_name(format!(".{name}.{label}.{}.{}", std::process::id(), id))
+}
+
+async fn stage_synced_file(
+    io: &ReloadIo,
+    destination: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<PathBuf, String> {
+    let temp = sibling_temp_path(destination, "tmp");
+    if let Err(error) = io.write_tmp_and_sync(&temp, bytes, permissions).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error);
+    }
+    Ok(temp)
+}
+
+async fn atomic_restore(io: &ReloadIo, destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    let permissions = tokio::fs::metadata(destination)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    let temp = stage_synced_file(io, destination, bytes, permissions).await?;
+    match io.rename(&temp, destination).await {
+        Ok(()) => sync_parent_directory(destination).await,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            Err(error)
+        },
+    }
+}
+
+async fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync directory {}: {error}", parent.display()))
+    })
+    .await
+    .map_err(|error| format!("directory sync task failed: {error}"))?
+}
+
+async fn remove_file_synced(path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => sync_parent_directory(path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to remove {}: {error}", path.display())),
+    }
+}
+
+async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'static str>, String> {
+    let old_raw = tokio::fs::read(&reloader.config_path)
+        .await
+        .map_err(|e| format!("failed to read existing config: {e}"))?;
+    let old_config = Config::load_from_file(&reloader.config_path).map_err(|e| e.to_string())?;
+    let old_backup_path = reloader.config_path.with_extension("toml.bak");
+    let old_backup = match tokio::fs::read(&old_backup_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("failed to read existing backup: {error}")),
+    };
+    let permissions = tokio::fs::metadata(&reloader.config_path)
+        .await
+        .map_err(|e| format!("failed to read config permissions: {e}"))?
+        .permissions();
+
+    // Parse, expand, validate, and build before any filesystem mutation.
+    let candidate =
+        build_config_candidate(raw, reloader.metrics.clone()).map_err(|error| error.to_string())?;
+    let mut restart_required = Vec::new();
+    if old_config.server.host != candidate.config.server.host {
+        restart_required.push("server.host");
+    }
+    if old_config.server.port != candidate.config.server.port {
+        restart_required.push("server.port");
+    }
+    if old_config.server.otel_endpoint != candidate.config.server.otel_endpoint {
+        restart_required.push("server.otel_endpoint");
+    }
+
+    let config_temp = stage_synced_file(
+        &reloader.io,
+        &reloader.config_path,
+        candidate.raw.as_bytes(),
+        Some(permissions.clone()),
+    )
+    .await?;
+    // The backup holds the same secrets as the config; never widen its mode.
+    let backup_temp = match stage_synced_file(
+        &reloader.io,
+        &old_backup_path,
+        &old_raw,
+        Some(permissions),
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&config_temp).await;
+            return Err(error);
+        },
+    };
+
+    // Install the new one-generation backup first. Until the config rename
+    // commits, failures restore the previous backup exactly.
+    if let Err(error) = reloader.io.rename(&backup_temp, &old_backup_path).await {
+        let _ = tokio::fs::remove_file(&config_temp).await;
+        let _ = tokio::fs::remove_file(&backup_temp).await;
+        return Err(format!("failed to replace backup: {error}"));
+    }
+    let commit_result = async {
+        sync_parent_directory(&old_backup_path).await?;
+        reloader
+            .io
+            .rename(&config_temp, &reloader.config_path)
+            .await?;
+        sync_parent_directory(&reloader.config_path).await
+    }
+    .await;
+    if let Err(error) = commit_result {
+        let _ = tokio::fs::remove_file(&config_temp).await;
+        let config_restore = atomic_restore(&reloader.io, &reloader.config_path, &old_raw).await;
+        let backup_restore = match old_backup {
+            Some(bytes) => atomic_restore(&reloader.io, &old_backup_path, &bytes).await,
+            None => remove_file_synced(&old_backup_path).await,
+        };
+        return match (config_restore, backup_restore) {
+            (Ok(()), Ok(())) => Err(format!(
+                "failed to commit config: {error}; previous files restored"
+            )),
+            (config_result, backup_result) => {
+                let message = format!(
+                    "failed to commit config: {error}; ROLLBACK FAILED: config={config_result:?}, backup={backup_result:?}"
+                );
+                error!("{}", message);
+                Err(message)
+            },
+        };
+    }
+
+    if reloader.sender.send(Arc::new(candidate.state)).is_err() {
+        let config_restore = atomic_restore(&reloader.io, &reloader.config_path, &old_raw).await;
+        let backup_restore = match old_backup {
+            Some(bytes) => atomic_restore(&reloader.io, &old_backup_path, &bytes).await,
+            None => remove_file_synced(&old_backup_path).await,
+        };
+        return match (config_restore, backup_restore) {
+            (Ok(()), Ok(())) => {
+                Err("state publication failed; previous config and backup restored".into())
+            },
+            (config_result, backup_result) => {
+                let message = format!(
+                    "state publication failed; ROLLBACK FAILED: config={config_result:?}, backup={backup_result:?}"
+                );
+                error!("{}", message);
+                Err(message)
+            },
+        };
+    }
+    Ok(restart_required)
+}
+
 async fn handle_http_reload(
     axum::extract::State(reloader): axum::extract::State<Reloader>,
 ) -> impl IntoResponse {
+    let _reload_guard = reloader.reload_lock.lock().await;
     let config = match Config::load_from_file(&reloader.config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -458,6 +777,7 @@ async fn handle_sighup(
     config_path: PathBuf,
     watch_sender: tokio::sync::watch::Sender<Arc<AppState>>,
     metrics: Arc<RuntimeMetrics>,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     #[cfg(unix)]
     {
@@ -472,6 +792,7 @@ async fn handle_sighup(
 
         info!("Registered SIGHUP reload listener");
         while sig.recv().await.is_some() {
+            let _reload_guard = reload_lock.lock().await;
             info!("SIGHUP received, reloading configuration...");
             match Config::load_from_file(&config_path) {
                 Ok(new_config) => {
@@ -500,6 +821,315 @@ async fn handle_sighup(
     }
 }
 
+fn editor_origin_matches_host(origin: &HeaderValue, host: &HeaderValue) -> bool {
+    let origin_str = match origin.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return false,
+    };
+    let host_str = match host.to_str() {
+        Ok(s) => s.trim(),
+        Err(_) => return false,
+    };
+    if origin_str == "null" || host_str.is_empty() {
+        return false;
+    }
+    let origin_url = match Url::parse(origin_str) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    // Scheme is syntax-checked, but authority is compared to Host because the
+    // gateway may sit behind an HTTPS-terminating Tailscale/reverse proxy.
+    if !matches!(origin_url.scheme(), "http" | "https")
+        || origin_url.username() != ""
+        || origin_url.password().is_some()
+        || origin_url.path() != "/"
+        || origin_url.query().is_some()
+        || origin_url.fragment().is_some()
+    {
+        return false;
+    }
+    let host_authority = match host_str.parse::<axum::http::uri::Authority>() {
+        Ok(authority) if authority.as_str().find('@').is_none() => authority,
+        _ => return false,
+    };
+    let origin_port = origin_url.port_or_known_default();
+    let host_port = host_authority.port_u16();
+    origin_url
+        .host_str()
+        .is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host_authority.host()))
+        && match (origin_port, host_port) {
+            (Some(origin_port), Some(host_port)) => origin_port == host_port,
+            (None, Some(_)) => false,
+            // The request scheme is not reliable behind a TLS terminator;
+            // an omitted Host port is therefore accepted for matching hosts.
+            (_, None) => true,
+        }
+}
+
+async fn require_same_origin(req: Request<Body>, next: Next) -> Response {
+    let origin_values: Vec<&HeaderValue> = req.headers().get_all(header::ORIGIN).iter().collect();
+    if origin_values.is_empty() {
+        return next.run(req).await;
+    }
+    if origin_values.len() != 1 {
+        warn!(target: "oxllm::security", "Rejected editor request with multiple Origin headers");
+        return origin_denied_response();
+    }
+    let host_header = match req.headers().get(header::HOST) {
+        Some(host) => host,
+        None => {
+            warn!(target: "oxllm::security", "Rejected editor request with Origin but no Host header");
+            return origin_denied_response();
+        },
+    };
+    if !editor_origin_matches_host(origin_values[0], host_header) {
+        warn!(
+            target: "oxllm::security",
+            origin = ?origin_values[0],
+            host = ?host_header,
+            "Rejected cross-origin editor request"
+        );
+        return origin_denied_response();
+    }
+    next.run(req).await
+}
+
+fn origin_denied_response() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "Access denied: cross-origin requests to editor endpoints are not permitted",
+            "type": "forbidden",
+            "code": 403
+        }
+    });
+    let mut response = Response::new(Body::from(body.to_string()));
+    *response.status_mut() = StatusCode::FORBIDDEN;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
+
+/// GET /config — raw bytes of config.toml without environment expansion.
+async fn handle_get_config(
+    axum::extract::State(reloader): axum::extract::State<Reloader>,
+) -> Response {
+    match tokio::fs::read(&reloader.config_path).await {
+        Ok(bytes) => {
+            let mut response = Response::new(Body::from(bytes));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/plain; charset=utf-8"),
+            );
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        },
+        Err(error) => {
+            error!(error = %error, "Failed to read raw config file");
+            let body = serde_json::json!({
+                "error": {
+                    "message": "Failed to read config file",
+                    "type": "internal_error",
+                    "code": 500
+                }
+            });
+            let mut response = Response::new(Body::from(body.to_string()));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ValidateRequest {
+    config: String,
+}
+
+#[derive(serde::Serialize)]
+struct ValidationErrorItem {
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    col: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct ValidateResponse {
+    valid: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<ValidationErrorItem>,
+}
+
+/// POST /validate — dry-run validator, performs zero writes.
+async fn handle_post_validate(
+    axum::extract::State(reloader): axum::extract::State<Reloader>,
+    axum::Extension(request_id): axum::Extension<String>,
+    axum::Json(payload): axum::Json<ValidateRequest>,
+) -> (StatusCode, axum::Json<ValidateResponse>) {
+    match build_config_candidate(payload.config, reloader.metrics.clone()) {
+        Ok(_candidate) => (
+            StatusCode::OK,
+            axum::Json(ValidateResponse {
+                valid: true,
+                errors: vec![],
+            }),
+        ),
+        Err(error) => {
+            warn!(request_id = %request_id, "Config dry-run validation failed");
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(ValidateResponse {
+                    valid: false,
+                    errors: vec![ValidationErrorItem {
+                        message: error.message,
+                        line: error.line,
+                        col: error.col,
+                    }],
+                }),
+            )
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyRequest {
+    config: String,
+}
+
+#[derive(serde::Serialize)]
+struct ApplyResponse {
+    applied: bool,
+    restart_required: Vec<&'static str>,
+}
+
+async fn handle_post_apply(
+    axum::extract::State(reloader): axum::extract::State<Reloader>,
+    axum::Extension(request_id): axum::Extension<String>,
+    axum::Json(payload): axum::Json<ApplyRequest>,
+) -> Response {
+    let _guard = reloader.reload_lock.lock().await;
+    match apply_candidate(&reloader, payload.config).await {
+        Ok(restart_required) => {
+            info!(request_id = %request_id, ?restart_required, "Applied new configuration successfully");
+            let body = serde_json::to_vec(&ApplyResponse {
+                applied: true,
+                restart_required,
+            })
+            .unwrap_or_default();
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        },
+        Err(error) => {
+            warn!(request_id = %request_id, error = %error, "Apply rejected or failed");
+            let body = serde_json::json!({
+                "applied": false,
+                "error": {
+                    "message": error,
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            });
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            let mut response = Response::new(Body::from(bytes));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        },
+    }
+}
+
+fn build_router(reloadable_state: ReloadableState) -> axum::Router {
+    use axum::routing::{get, post};
+    axum::Router::new()
+        .route("/v1/models", get(routes::list_models))
+        .route("/v1/embeddings", post(routes::create_embeddings))
+        .route(
+            "/v1/chat/completions",
+            post(routes::create_chat_completions),
+        )
+        .route("/status", get(routes::get_status))
+        .route("/dashboard", get(routes::dashboard))
+        .route("/health", get(health_check))
+        .route(
+            "/config",
+            get(handle_get_config).layer(middleware::from_fn(require_same_origin)),
+        )
+        .route(
+            "/validate",
+            post(handle_post_validate).layer(middleware::from_fn(require_same_origin)),
+        )
+        .route(
+            "/apply",
+            post(handle_post_apply).layer(middleware::from_fn(require_same_origin)),
+        )
+        .route("/reload", post(handle_http_reload))
+        .route(
+            "/admin/providers/{name}/offline",
+            post(routes::admin_offline),
+        )
+        .route("/admin/providers/{name}/online", post(routes::admin_online))
+        .route("/admin/providers/{name}/reset", post(routes::admin_reset))
+        .layer(middleware::from_fn(tailnet_only))
+        .layer(middleware::from_fn(add_request_id))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods([
+                    axum::http::Method::GET,
+                    axum::http::Method::POST,
+                    axum::http::Method::OPTIONS,
+                ])
+                .allow_headers(Any),
+        )
+        .with_state(reloadable_state)
+}
+
+/// Binds the configured IPv4 host plus a loopback listener for local tooling.
+///
+/// When the configured host is itself loopback only one listener is created,
+/// avoiding a duplicate bind on the same address.
+async fn bind_server_listeners(
+    host: IpAddr,
+    port: u16,
+) -> Result<Vec<tokio::net::TcpListener>, Box<dyn std::error::Error>> {
+    let host_addr = SocketAddr::new(host, port);
+    let host_listener = tokio::net::TcpListener::bind(host_addr).await?;
+    info!("Listening on http://{} (configured IPv4 host)", host_addr);
+
+    // Only 127.0.0.1 itself is skipped; other 127/8 hosts still get the
+    // dedicated loopback listener so local tooling can keep using 127.0.0.1.
+    let host_is_dedicated_loopback = host == IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    if host_is_dedicated_loopback {
+        return Ok(vec![host_listener]);
+    }
+    let loopback_port = if port == 0 {
+        host_listener.local_addr()?.port()
+    } else {
+        port
+    };
+    let loopback_addr = SocketAddr::from(([127, 0, 0, 1], loopback_port));
+    let loopback_listener = tokio::net::TcpListener::bind(loopback_addr).await?;
+    info!("Listening on http://{} (loopback)", loopback_addr);
+    Ok(vec![host_listener, loopback_listener])
+}
+
 async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = resolve_config_path(config_path);
     // 1. Load initial config
@@ -521,10 +1151,12 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // 5. Spawn SIGHUP listener
     let config_path_clone = config_path.clone();
+    let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(handle_sighup(
         config_path_clone,
         watch_sender.clone(),
         metrics.clone(),
+        reload_lock.clone(),
     ));
 
     // 6. Build Axum Router
@@ -533,6 +1165,8 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         sender: watch_sender.clone(),
         config_path: config_path.clone(),
         metrics: metrics.clone(),
+        reload_lock: reload_lock.clone(),
+        io: ReloadIo::default(),
     };
     let reloadable_state = ReloadableState {
         app_state: watch_receiver,
@@ -541,112 +1175,64 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         reloader,
     };
 
-    use axum::routing::{get, post};
-    let app = axum::Router::new()
-        .route("/v1/models", get(routes::list_models))
-        .route("/v1/embeddings", post(routes::create_embeddings))
-        .route(
-            "/v1/chat/completions",
-            post(routes::create_chat_completions),
-        )
-        .route(
-            "/status",
-            get(routes::get_status).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/dashboard",
-            get(routes::dashboard).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/health",
-            get(health_check).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/reload",
-            post(handle_http_reload).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/admin/providers/{name}/offline",
-            post(routes::admin_offline).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/admin/providers/{name}/online",
-            post(routes::admin_online).layer(middleware::from_fn(localhost_only)),
-        )
-        .route(
-            "/admin/providers/{name}/reset",
-            post(routes::admin_reset).layer(middleware::from_fn(localhost_only)),
-        )
-        .layer(middleware::from_fn(add_request_id))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods([
-                    axum::http::Method::GET,
-                    axum::http::Method::POST,
-                    axum::http::Method::OPTIONS,
-                ])
-                .allow_headers(Any),
-        )
-        .with_state(reloadable_state);
+    let app = build_router(reloadable_state);
+
+    // Bind all requested interfaces before serving so failures are fail-fast.
+    let host: std::net::Ipv4Addr = config.server.host.parse()?;
+    let mut listeners = bind_server_listeners(IpAddr::V4(host), config.server.port).await?;
 
     // Write PID file
     if let Err(e) = write_pid_file() {
         warn!("Failed to write PID file: {}", e);
     }
 
-    // Start listening
-    let port = config.server.port;
-    let listener = match config.server.bind_family.as_str() {
-        "ipv6" => {
-            let addr = format!("[::]:{}", port);
-            info!("Listening on http://{} (IPv6 only)", addr);
-            tokio::net::TcpListener::bind(&addr).await?
-        },
-        "dual" => {
-            let addr = std::net::SocketAddr::new(
-                std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
-                port,
-            );
-            let socket = socket2::Socket::new(
-                socket2::Domain::IPV6,
-                socket2::Type::STREAM,
-                Some(socket2::Protocol::TCP),
-            )
-            .map_err(|e| format!("Failed to create socket: {}", e))?;
-            socket
-                .set_only_v6(false)
-                .map_err(|e| format!("Failed to set dual-stack: {}", e))?;
-            socket
-                .set_reuse_address(true)
-                .map_err(|e| format!("Failed to set reuse address: {}", e))?;
-            socket
-                .bind(&addr.into())
-                .map_err(|e| format!("Failed to bind: {}", e))?;
-            socket
-                .listen(1024)
-                .map_err(|e| format!("Failed to listen: {}", e))?;
-            socket
-                .set_nonblocking(true)
-                .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
-            info!("Listening on [::]:{} (dual-stack IPv4/IPv6)", port);
-            tokio::net::TcpListener::from_std(socket.into())
-                .map_err(|e| format!("Failed to create tokio listener: {}", e))?
-        },
-        _ => {
-            // Default: IPv4
-            let addr = format!("{}:{}", config.server.host, port);
-            info!("Listening on http://{} (IPv4)", addr);
-            tokio::net::TcpListener::bind(&addr).await?
-        },
-    };
-
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    let make_service = app
+        .clone()
+        .into_make_service_with_connect_info::<SocketAddr>();
+    let host_server = axum::serve(listeners.remove(0), make_service);
+    if let Some(loopback_listener) = listeners.pop() {
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let mut host_shutdown = shutdown_receiver.clone();
+        let mut loopback_shutdown = shutdown_receiver;
+        let loopback_service = app.into_make_service_with_connect_info::<SocketAddr>();
+        let mut host_handle = tokio::spawn(async move {
+            host_server
+                .with_graceful_shutdown(async move {
+                    let _ = host_shutdown.changed().await;
+                })
+                .await
+        });
+        let mut loopback_handle = tokio::spawn(async move {
+            axum::serve(loopback_listener, loopback_service)
+                .with_graceful_shutdown(async move {
+                    let _ = loopback_shutdown.changed().await;
+                })
+                .await
+        });
+        tokio::select! {
+            result = &mut host_handle => {
+                let _ = shutdown_sender.send(true);
+                let loopback_result = loopback_handle.await?;
+                result??;
+                loopback_result?;
+            },
+            result = &mut loopback_handle => {
+                let _ = shutdown_sender.send(true);
+                let host_result = host_handle.await?;
+                result??;
+                host_result?;
+            },
+            _ = shutdown_signal() => {
+                let _ = shutdown_sender.send(true);
+                host_handle.await??;
+                loopback_handle.await??;
+            },
+        }
+    } else {
+        host_server
+            .with_graceful_shutdown(shutdown_signal())
+            .await?;
+    }
 
     Ok(())
 }
@@ -1126,6 +1712,8 @@ mod integration_tests {
             sender: _watch_sender.clone(),
             config_path: PathBuf::from("config.toml"),
             metrics: Arc::new(RuntimeMetrics::default()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io: ReloadIo::default(),
         };
 
         let reloadable_state = ReloadableState {
@@ -1147,7 +1735,12 @@ mod integration_tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1224,6 +1817,8 @@ mod integration_tests {
             sender: _watch_sender.clone(),
             config_path: PathBuf::from("config.toml"),
             metrics: Arc::new(RuntimeMetrics::default()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io: ReloadIo::default(),
         };
 
         let reloadable_state = ReloadableState {
@@ -1245,7 +1840,12 @@ mod integration_tests {
         let proxy_addr = listener.local_addr().unwrap();
 
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1414,6 +2014,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1426,7 +2028,12 @@ mod integration_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1547,6 +2154,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1559,7 +2168,12 @@ mod integration_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1646,6 +2260,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
 
@@ -1670,7 +2286,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         // Call admin reset
@@ -1767,6 +2388,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1783,7 +2406,12 @@ mod integration_tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1860,6 +2488,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1872,7 +2502,12 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -1945,6 +2580,8 @@ mod integration_tests {
                 sender: _ws.clone(),
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1956,7 +2593,12 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         // Verify provider is disabled
@@ -2043,6 +2685,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -2057,7 +2701,12 @@ mod integration_tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(listener, router).await.unwrap();
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2142,6 +2791,11 @@ mod integration_tests {
         assert!(html.contains("data.virtual_models"));
         assert!(html.contains("target.weight"));
         assert!(html.contains("Recent requests"));
+        assert!(html.contains("Configuration editor"));
+        assert!(html.contains("/config"));
+        assert!(html.contains("/validate"));
+        assert!(html.contains("textContent"));
+        assert!(html.contains("JSON.stringify({ config: editor.value })"));
     }
 
     // -----------------------------------------------------------------------
@@ -2195,35 +2849,190 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         (app_state, rs)
     }
 
-    /// Builds a test router with all middleware layers (request-id, CORS).
+    /// Configures a request as if it arrived from the given peer address.
+    fn request_from_peer(uri: &str, peer: IpAddr, method: axum::http::Method) -> Request<Body> {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .body(Body::empty())
+            .expect("static test request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer, 0)));
+        request
+    }
+
+    #[tokio::test]
+    async fn dual_listener_serves_configured_and_loopback_addresses() {
+        let mut listeners = bind_server_listeners("127.0.0.2".parse().expect("static IP"), 0)
+            .await
+            .expect("loopback listeners should bind");
+        assert_eq!(listeners.len(), 2);
+        let single_listener =
+            bind_server_listeners(IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)), 0)
+                .await
+                .expect("localhost host should bind");
+        assert_eq!(single_listener.len(), 1);
+        let host_addr = listeners[0].local_addr().expect("listener address");
+        let loopback_addr = listeners[1].local_addr().expect("listener address");
+        let host_listener = listeners.remove(0);
+        let loopback_listener = listeners.remove(0);
+        assert_eq!(host_addr.ip(), IpAddr::from([127, 0, 0, 2]));
+        assert_eq!(loopback_addr.ip(), IpAddr::from([127, 0, 0, 1]));
+        assert_eq!(host_addr.port(), loopback_addr.port());
+
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_state, reloadable_state) = build_test_state(upstream);
+        let router = build_router(reloadable_state);
+        let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let mut shutdown_host = shutdown_receiver.clone();
+        let mut shutdown_loopback = shutdown_receiver;
+        let host_router = router.clone();
+        let loopback_router = router;
+        let host_task = tokio::spawn(async move {
+            axum::serve(
+                host_listener,
+                host_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_host.changed().await;
+            })
+            .await
+        });
+        let loopback_task = tokio::spawn(async move {
+            axum::serve(
+                loopback_listener,
+                loopback_router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = shutdown_loopback.changed().await;
+            })
+            .await
+        });
+
+        let client = reqwest::Client::new();
+        for address in [host_addr, loopback_addr] {
+            let response = client
+                .get(format!("http://{address}/health"))
+                .send()
+                .await
+                .expect("health request should connect");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let _ = shutdown_sender.send(true);
+        host_task
+            .await
+            .expect("host server task")
+            .expect("host server");
+        loopback_task
+            .await
+            .expect("loopback server task")
+            .expect("loopback server");
+    }
+
+    #[tokio::test]
+    async fn router_builds_and_guards_all_routes() {
+        use tower::util::ServiceExt;
+
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_state, reloadable_state) = build_test_state(upstream);
+        let router = build_router(reloadable_state);
+
+        // Loopback peer reaches every production route without auth.
+        for (method, uri) in [
+            (axum::http::Method::GET, "/v1/models"),
+            (axum::http::Method::GET, "/status"),
+            (axum::http::Method::GET, "/dashboard"),
+            (axum::http::Method::GET, "/health"),
+            (axum::http::Method::POST, "/reload"),
+            (
+                axum::http::Method::POST,
+                "/admin/providers/provider/offline",
+            ),
+            (axum::http::Method::POST, "/admin/providers/provider/online"),
+            (axum::http::Method::POST, "/admin/providers/provider/reset"),
+            (axum::http::Method::POST, "/v1/embeddings"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request_from_peer(
+                    uri,
+                    IpAddr::from([127, 0, 0, 1]),
+                    method.clone(),
+                ))
+                .await
+                .expect("router must answer a loopback request");
+            assert_ne!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "loopback peer was denied on {uri}"
+            );
+        }
+
+        // A public source is denied on every route, including /v1.
+        for (method, uri) in [
+            (axum::http::Method::GET, "/v1/models"),
+            (axum::http::Method::GET, "/status"),
+            (axum::http::Method::GET, "/dashboard"),
+            (axum::http::Method::GET, "/health"),
+            (axum::http::Method::POST, "/reload"),
+            (
+                axum::http::Method::POST,
+                "/admin/providers/provider/offline",
+            ),
+            (axum::http::Method::POST, "/admin/providers/provider/online"),
+            (axum::http::Method::POST, "/admin/providers/provider/reset"),
+            (axum::http::Method::POST, "/v1/chat/completions"),
+            (axum::http::Method::POST, "/v1/embeddings"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request_from_peer(
+                    uri,
+                    IpAddr::from([8, 8, 8, 8]),
+                    method.clone(),
+                ))
+                .await
+                .expect("router must answer a forged peer request");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "public source unexpectedly reached {uri}"
+            );
+            assert!(
+                response.headers().contains_key("x-request-id"),
+                "403 on {uri} lost the x-request-id header"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "403 on {uri} is not JSON"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("denial body must be readable");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body).expect("denial body must be JSON");
+            assert_eq!(body["error"]["code"], 403, "403 on {uri} has wrong code");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("Access denied")),
+                "403 on {uri} has wrong message: {body}"
+            );
+        }
+    }
+
+    /// Uses the exact router and security middleware wired by production.
     fn build_test_router(state: ReloadableState) -> axum::Router {
-        axum::Router::new()
-            .route(
-                "/v1/chat/completions",
-                axum::routing::post(routes::create_chat_completions),
-            )
-            .route(
-                "/v1/embeddings",
-                axum::routing::post(routes::create_embeddings),
-            )
-            .route("/v1/models", axum::routing::get(routes::list_models))
-            .layer(middleware::from_fn(add_request_id))
-            .layer(
-                CorsLayer::new()
-                    .allow_origin(Any)
-                    .allow_methods([
-                        axum::http::Method::GET,
-                        axum::http::Method::POST,
-                        axum::http::Method::OPTIONS,
-                    ])
-                    .allow_headers(Any),
-            )
-            .with_state(state)
+        build_router(state)
     }
 
     // -----------------------------------------------------------------------
@@ -2250,7 +3059,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2298,7 +3112,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2347,7 +3166,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2402,7 +3226,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2450,7 +3279,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2501,7 +3335,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2561,7 +3400,12 @@ mod integration_tests {
         let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let proxy_addr = proxy_listener.local_addr().unwrap();
         tokio::spawn(async move {
-            axum::serve(proxy_listener, router).await.unwrap();
+            axum::serve(
+                proxy_listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
         });
 
         let client = reqwest::Client::new();
@@ -2585,5 +3429,991 @@ mod integration_tests {
             id_str
         );
         assert_eq!(id_str.len(), 22);
+    }
+}
+
+#[cfg(test)]
+mod editor_tests {
+    //! e01s02: raw config view + dry-run Validate endpoint behavior.
+    use super::*;
+    use axum::body::Body;
+    use tower::util::ServiceExt;
+
+    /// Raw TOML used by editor endpoint tests; deliberately contains a literal
+    /// secret and a ${VAR} placeholder that must survive byte-for-byte.
+    const RAW_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 0
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov"
+enabled = true
+base_url = "http://127.0.0.1:1"
+api_key = "sk-editor-secret"
+models = ["model"]
+"#;
+
+    fn editor_request(method: &str, uri: &str, body: Option<Vec<u8>>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8080");
+        if body.is_some() {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        }
+        let mut request = builder
+            .body(body.map_or_else(Body::empty, Body::from))
+            .expect("static test request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                12345u16,
+            ))));
+        request
+    }
+
+    async fn validate_via_router(raw: String) -> (StatusCode, serde_json::Value) {
+        let router = editor_router(std::path::PathBuf::from("unused-config.toml")).await;
+        let payload = serde_json::json!({ "config": raw })
+            .to_string()
+            .into_bytes();
+        let response = router
+            .oneshot(editor_request("POST", "/validate", Some(payload)))
+            .await
+            .expect("router answers validation");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        (status, value)
+    }
+
+    async fn editor_router(config_path: std::path::PathBuf) -> axum::Router {
+        let (_ws, wr) = tokio::sync::watch::channel(Arc::new(AppState {
+            providers: vec![],
+            virtual_models: std::collections::HashMap::new(),
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::new(),
+            upstream_timeout_secs: 5,
+        }));
+        let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(8);
+        let reloadable_state = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(telemetry_tx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path,
+                metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
+            },
+        };
+        build_router(reloadable_state)
+    }
+
+    #[tokio::test]
+    async fn config_raw_serves_exact_bytes_without_expansion() {
+        let dir = std::env::temp_dir().join(format!("oxllm-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+
+        let router = editor_router(config_path.clone()).await;
+        let response = router
+            .oneshot(editor_request("GET", "/config", None))
+            .await
+            .expect("router answers /config");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("no-store")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("utf-8"),
+            RAW_CONFIG,
+            "raw config bytes must round-trip exactly, including secrets and placeholders"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn validate_reports_diagnostics_without_touching_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("oxllm-editor-validate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+        let backup = dir.join("config.toml.bak");
+        std::fs::write(&backup, b"old").expect("test bak");
+
+        let router = editor_router(config_path.clone()).await;
+        let payload = br#"{"config":"[server]\nhost = \"127.0.0.1\"\nport = 8080\notel_endpoint = \"http://127.0.0.1:4318\"\nport_typo = 1\n"}"#.to_vec();
+        let response = router
+            .oneshot(editor_request("POST", "/validate", Some(payload)))
+            .await
+            .expect("router answers /validate");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["valid"], serde_json::json!(false));
+        let message = value["errors"][0]["message"]
+            .as_str()
+            .expect("message present")
+            .to_string();
+        assert!(
+            message.contains("port_typo"),
+            "diagnostic must name the field: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).expect("config intact"),
+            RAW_CONFIG.as_bytes()
+        );
+        assert_eq!(std::fs::read(&backup).expect("bak intact"), b"old");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_diagnostics_label_approximate_location_after_expansion() {
+        let raw = "[server]\nhost = \"127.0.0.1\"\nport = 8080\notel_endpoint = \"http://127.0.0.1:4318\"\n\n[[providers]]\nname = \"p\"\nenabled = true\nbase_url = \"${OXLLM_EDITOR_TEST_BASE}\"\napi_key = \"k\"\nmodels = [\"m\"]\nport_typo = 1\n";
+        std::env::set_var("OXLLM_EDITOR_TEST_BASE", "https://example.com");
+        let (_status, value) = validate_via_router(raw.to_string()).await;
+        let message = value["errors"][0]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(message.contains("port_typo"), "{message}");
+        assert!(
+            message.contains("approximate"),
+            "expanded spans must be labeled: {message}"
+        );
+        assert_eq!(value["errors"][0]["line"], serde_json::json!(11));
+        std::env::remove_var("OXLLM_EDITOR_TEST_BASE");
+    }
+
+    #[tokio::test]
+    async fn validate_matrix_is_dry_run_for_all_candidate_failures() {
+        let dir = std::env::temp_dir().join(format!("oxllm-editor-matrix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+        let backup = dir.join("config.toml.bak");
+        std::fs::write(&backup, b"exact backup bytes").expect("test backup");
+        let router = editor_router(config_path.clone()).await;
+        let base = RAW_CONFIG;
+        let cases = [
+            ("syntax", "not = [valid".to_string(), "TOML"),
+            (
+                "missing environment variable",
+                base.replace("sk-editor-secret", "${OXLLM_EDITOR_MISSING_TEST_VAR}").to_string(),
+                "OXLLM_EDITOR_MISSING_TEST_VAR",
+            ),
+            (
+                "dangling provider reference",
+                base.replace("name = \"prov\"", "name = \"elsewhere\"")
+                    .to_string() + "\n[virtual_models]\nvm = [{ provider = \"prov\", model = \"model\" }]\n",
+                "prov",
+            ),
+            (
+                "zero target weight",
+                base.to_string() + "\n[virtual_models]\nvm = [{ provider = \"prov\", model = \"model\", weight = 0 }]\n",
+                "positive weight",
+            ),
+            (
+                "malformed enabled base URL",
+                base.replace("http://127.0.0.1:1", "file:///etc/passwd").to_string(),
+                "http or https",
+            ),
+        ];
+        for (label, raw, expected) in cases {
+            let payload = serde_json::json!({ "config": raw })
+                .to_string()
+                .into_bytes();
+            let response = router
+                .clone()
+                .oneshot(editor_request("POST", "/validate", Some(payload)))
+                .await
+                .expect("router answers validation");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            let message = value["errors"][0]["message"]
+                .as_str()
+                .expect("error message");
+            assert!(message.contains(expected), "{label}: {message}");
+            assert_eq!(
+                std::fs::read(&config_path).expect("config intact"),
+                RAW_CONFIG.as_bytes(),
+                "{label}"
+            );
+            assert_eq!(
+                std::fs::read(&backup).expect("backup intact"),
+                b"exact backup bytes",
+                "{label}"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_valid_config_with_200() {
+        let dir = std::env::temp_dir().join(format!("oxllm-editor-valid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+
+        let router = editor_router(config_path).await;
+        let payload = br#"{"config":"[server]\nhost = \"100.115.92.2\"\nport = 8080\notel_endpoint = \"http://127.0.0.1:4318\"\n\n[[providers]]\nname = \"p\"\nenabled = true\nbase_url = \"https://example.com\"\napi_key = \"k\"\nmodels = [\"m\"]\n"}"#.to_vec();
+        let response = router
+            .oneshot(editor_request("POST", "/validate", Some(payload)))
+            .await
+            .expect("router answers /validate");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["valid"], serde_json::json!(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn editor_endpoints_reject_cross_origin_requests() {
+        let router = editor_router(std::path::PathBuf::from("unused-config.toml")).await;
+
+        // Cross-origin GET /config must be refused.
+        let mut request = editor_request("GET", "/config", None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Same-origin GET /config is allowed.
+        let mut request = editor_request("GET", "/config", None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+        // Cross-origin POST /validate must be refused before validation runs.
+        let mut request = editor_request(
+            "POST",
+            "/validate",
+            Some(br#"{"config":"[server]"}"#.to_vec()),
+        );
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Origin: null is refused.
+        let mut request = editor_request("GET", "/config", None);
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static("null"));
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Duplicate Origin headers are refused.
+        let mut request = editor_request("GET", "/config", None);
+        request.headers_mut().append(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        request.headers_mut().append(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = router.oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn origin_policy_matches_same_authority_and_rejects_mismatches() {
+        // Same-origin, explicit and implicit ports.
+        assert!(editor_origin_matches_host(
+            &HeaderValue::from_static("http://127.0.0.1:8080"),
+            &HeaderValue::from_static("127.0.0.1:8080"),
+        ));
+        assert!(editor_origin_matches_host(
+            &HeaderValue::from_static("http://host.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        assert!(editor_origin_matches_host(
+            &HeaderValue::from_static("https://host.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        // Different host, port, or scheme.
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("http://evil.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("http://host.example:8080"),
+            &HeaderValue::from_static("host.example:9090"),
+        ));
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("ftp://host.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        // "null" and paths/queries are not same-origin.
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("null"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("http://host.example/path"),
+            &HeaderValue::from_static("host.example"),
+        ));
+    }
+}
+
+#[cfg(test)]
+mod apply_tests {
+    //! e01s03: Apply pipeline, one-generation backup, atomic swap, serialization,
+    //! and continuity tests.
+    use super::*;
+
+    #[test]
+    fn reload_serial_lock_serializes_across_clones() {
+        // Task 1: Verify the reload/apply lock exists on Reloader and serializes
+        // across clones of Reloader, preventing concurrent HTTP reload,
+        // SIGHUP, and Apply operations.
+        let (_sender, _receiver) = tokio::sync::watch::channel(Arc::new(AppState {
+            providers: vec![],
+            virtual_models: std::collections::HashMap::new(),
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::new(),
+            upstream_timeout_secs: 5,
+        }));
+        let reloader = Reloader {
+            sender: _sender,
+            config_path: PathBuf::from("config.toml"),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io: ReloadIo::default(),
+        };
+        let clone = reloader.clone();
+        let guard = reloader.reload_lock.try_lock();
+        assert!(
+            guard.is_ok(),
+            "First try_lock on reload_lock should succeed"
+        );
+        assert!(
+            clone.reload_lock.try_lock().is_err(),
+            "Cloned reloader lock should be busy while held by the first instance"
+        );
+        drop(guard);
+        assert!(
+            clone.reload_lock.try_lock().is_ok(),
+            "Once released, clone should be able to acquire the reload_lock"
+        );
+    }
+}
+
+#[cfg(test)]
+mod apply_pipeline_tests {
+    use super::*;
+    use axum::body::Body;
+    use tower::util::ServiceExt;
+
+    const BASE_APPLY_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov1"
+enabled = true
+base_url = "http://127.0.0.1:1"
+api_key = "initial-secret"
+models = ["m1"]
+
+[virtual_models]
+vm1 = [{ provider = "prov1", model = "m1" }]
+"#;
+
+    const UPDATED_APPLY_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov2"
+enabled = true
+base_url = "http://127.0.0.1:2"
+api_key = "second-secret"
+models = ["m2"]
+
+[virtual_models]
+vm2 = [{ provider = "prov2", model = "m2" }]
+"#;
+
+    fn setup_apply_fixture(io: ReloadIo) -> (tempfile_dir::TempDirGuard, Reloader, axum::Router) {
+        let dir = tempfile_dir::TempDirGuard::new("oxllm-apply");
+        let config_path = dir.path.join("config.toml");
+        std::fs::write(&config_path, BASE_APPLY_CONFIG).expect("initial config write");
+
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let initial_config = Config::load_from_file(&config_path).expect("initial parse");
+        let initial_state =
+            build_app_state(initial_config, metrics.clone()).expect("initial state");
+        let (sender, receiver) = tokio::sync::watch::channel(Arc::new(initial_state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let reloader = Reloader {
+            sender,
+            config_path,
+            metrics,
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io,
+        };
+        let reloadable_state = ReloadableState {
+            app_state: receiver,
+            telemetry: TelemetryClient::new(tx),
+            start_time: Instant::now(),
+            reloader: reloader.clone(),
+        };
+        let router = build_router(reloadable_state);
+        (dir, reloader, router)
+    }
+
+    mod tempfile_dir {
+        use std::path::PathBuf;
+        pub struct TempDirGuard {
+            pub path: PathBuf,
+        }
+        impl TempDirGuard {
+            pub fn new(prefix: &str) -> Self {
+                let id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let path =
+                    std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+                std::fs::create_dir_all(&path).expect("temp dir create");
+                Self { path }
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_reload_continuity_swaps_config_writes_exact_backup_preserves_metrics() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        // Record initial metric state to verify continuity
+        // prompt=10, cached=4, completion=6 -> total_tokens = 16
+        reloader.metrics.daily_tokens.record_usage(10, 4, 6);
+        reloader.metrics.push_request(RequestLogEntry {
+            timestamp: 100,
+            model_requested: "prior-model".into(),
+            virtual_model: Some("prior-vm".into()),
+            provider: "prov1".into(),
+            cached_tokens: 4,
+            uncached_tokens: 6,
+            status_code: 200,
+        });
+
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 1. Config file is new bytes
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            UPDATED_APPLY_CONFIG
+        );
+        // 2. Backup file exists and holds EXACT old bytes
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        // 3. Active state was reloaded without restart
+        let active_state = reloader.sender.subscribe().borrow().clone();
+        assert_eq!(active_state.providers.len(), 1);
+        assert_eq!(active_state.providers[0].name, "prov2");
+        // 4. Metrics continuity preserved
+        assert_eq!(reloader.metrics.daily_tokens.snapshot().total_tokens, 16);
+        assert_eq!(reloader.metrics.recent_requests().len(), 1);
+        assert_eq!(
+            reloader.metrics.recent_requests()[0].model_requested,
+            "prior-model"
+        );
+
+        // 5. Second apply overwrites backup with the second config (one-generation)
+        const THIRD_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov3"
+enabled = true
+base_url = "http://127.0.0.1:3"
+api_key = "third-secret"
+models = ["m3"]
+
+[virtual_models]
+vm3 = [{ provider = "prov3", model = "m3" }]
+"#;
+        let payload = serde_json::json!({ "config": THIRD_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("second apply");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            THIRD_CONFIG
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            UPDATED_APPLY_CONFIG,
+            "one-generation backup must hold the second config, not the original"
+        );
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_invalid_no_write_and_preserves_old_state() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+
+        // Invalid TOML with unknown field
+        let bad_config = BASE_APPLY_CONFIG.to_string() + "\nbogus_field = 42\n";
+        let payload = serde_json::json!({ "config": bad_config })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        assert!(
+            !backup_path.exists(),
+            "No .bak file should be created on invalid apply"
+        );
+        let active = reloader.sender.subscribe().borrow().clone();
+        assert_eq!(active.providers[0].name, "prov1");
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_reports_restart_required_when_startup_fields_change() {
+        let (dir, _reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let changed = BASE_APPLY_CONFIG
+            .replace("port = 8080", "port = 9090")
+            .replace(
+                "otel_endpoint = \"http://127.0.0.1:4318\"",
+                "otel_endpoint = \"http://127.0.0.1:9999\"",
+            );
+        let payload = serde_json::json!({ "config": changed })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["applied"], serde_json::json!(true));
+        let restart = val["restart_required"].as_array().unwrap();
+        let items: Vec<&str> = restart.iter().filter_map(|v| v.as_str()).collect();
+        assert!(items.contains(&"server.port"));
+        assert!(items.contains(&"server.otel_endpoint"));
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_atomic_sync_failure_leaves_config_and_bak_untouched() {
+        let failing_io = ReloadIo {
+            fail_sync: Some("simulated sync write failure".into()),
+            fail_rename: None,
+            fail_rename_on_call: None,
+            rename_calls: Arc::new(AtomicU64::new(0)),
+        };
+        let (dir, reloader, router) = setup_apply_fixture(failing_io);
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert!(!backup_path.exists());
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_atomic_rename_failure_restores_previous_backup() {
+        let (dir, reloader, _router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        std::fs::write(&backup_path, b"pre-existing-backup-exact-bytes").unwrap();
+
+        // Inject rename failure: backup rename succeeds, but config rename fails
+        let failing_reloader = Reloader {
+            io: ReloadIo {
+                fail_sync: None,
+                fail_rename: None,
+                fail_rename_on_call: Some(2),
+                rename_calls: Arc::new(AtomicU64::new(0)),
+            },
+            ..reloader.clone()
+        };
+        let reloadable_state = ReloadableState {
+            app_state: reloader.sender.subscribe(),
+            telemetry: TelemetryClient::new(tokio::sync::mpsc::channel(1).0),
+            start_time: Instant::now(),
+            reloader: failing_reloader,
+        };
+        let failing_router = build_router(reloadable_state);
+
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = failing_router
+            .oneshot(request)
+            .await
+            .expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Previous config and pre-existing backup must both be intact
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            "pre-existing-backup-exact-bytes"
+        );
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_origin_cross_origin_rejected_before_write() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Config untouched, no backup
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert!(!backup_path.exists());
+        let _ = dir;
+    }
+    #[tokio::test]
+    async fn apply_reload_continuity_publish_failure_rolls_back_atomically() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        drop(router);
+        // A sender with no live receivers forces publication to fail.
+        let (sender, receiver) =
+            tokio::sync::watch::channel(reloader.sender.subscribe().borrow().clone());
+        drop(receiver);
+        let failing_reloader = Reloader {
+            sender,
+            ..reloader.clone()
+        };
+        let reloadable_state = ReloadableState {
+            app_state: reloader.sender.subscribe(),
+            telemetry: TelemetryClient::new(tokio::sync::mpsc::channel(1).0),
+            start_time: Instant::now(),
+            reloader: failing_reloader,
+        };
+        let router = build_router(reloadable_state);
+
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Previous config restored atomically
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        // Pre-existing backup was absent; no lingering .bak left after rollback
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert!(!backup_path.exists());
+        let _ = dir;
+    }
+    #[tokio::test]
+    async fn reload_serial_concurrent_applies_cannot_interleave() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let config_a = UPDATED_APPLY_CONFIG.to_string();
+        let config_b = BASE_APPLY_CONFIG.replace("prov1", "provB");
+
+        let make_request = |body: Vec<u8>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/apply")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+            request
+        };
+
+        let router_a = router.clone();
+        let router_b = router.clone();
+        let a = tokio::spawn(async move {
+            let body = serde_json::json!({ "config": config_a })
+                .to_string()
+                .into_bytes();
+            router_a.oneshot(make_request(body)).await.expect("apply A")
+        });
+        let b = tokio::spawn(async move {
+            let body = serde_json::json!({ "config": config_b })
+                .to_string()
+                .into_bytes();
+            router_b.oneshot(make_request(body)).await.expect("apply B")
+        });
+        let (response_a, response_b) = (a.await.expect("join A"), b.await.expect("join B"));
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_b.status(), StatusCode::OK);
+
+        // Whatever the interleaving, the on-disk config must be exactly one
+        // candidate and the backup must hold the other (or the original).
+        let final_config = std::fs::read_to_string(&reloader.config_path).unwrap();
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let backup = std::fs::read_to_string(&backup_path).unwrap();
+        let candidate_a = UPDATED_APPLY_CONFIG;
+        let candidate_b = BASE_APPLY_CONFIG.replace("prov1", "provB");
+        let a_final = final_config == candidate_a;
+        let b_final = final_config == candidate_b;
+        assert!(
+            a_final || b_final,
+            "final config must equal one full candidate, got: {final_config}"
+        );
+        if a_final {
+            assert!(
+                backup == candidate_b || backup == BASE_APPLY_CONFIG,
+                "backup must hold a complete prior generation"
+            );
+        } else {
+            assert!(
+                backup == candidate_a || backup == BASE_APPLY_CONFIG,
+                "backup must hold a complete prior generation"
+            );
+        }
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_backup_permissions_are_no_broader_than_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        std::fs::set_permissions(
+            &reloader.config_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let backup = reloader.config_path.with_extension("toml.bak");
+        let mode = std::fs::metadata(backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_atomic_backup_rename_failure_preserves_config_and_existing_backup() {
+        let (dir, reloader, _router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let old_backup = b"old backup bytes exact";
+        std::fs::write(&backup_path, old_backup).unwrap();
+        let failing_reloader = Reloader {
+            io: ReloadIo {
+                fail_sync: None,
+                fail_rename: None,
+                fail_rename_on_call: Some(1),
+                rename_calls: Arc::new(AtomicU64::new(0)),
+            },
+            ..reloader.clone()
+        };
+        let result = apply_candidate(&failing_reloader, UPDATED_APPLY_CONFIG.to_string()).await;
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG.as_bytes()
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), old_backup);
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_reload_continuity_publish_rollback_failure_is_reported() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        drop(router);
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let old_backup = b"existing backup exact bytes";
+        std::fs::write(&backup_path, old_backup).unwrap();
+        let (sender, receiver) =
+            tokio::sync::watch::channel(reloader.sender.subscribe().borrow().clone());
+        drop(receiver);
+        let failing_reloader = Reloader {
+            sender,
+            io: ReloadIo {
+                fail_sync: None,
+                fail_rename: None,
+                fail_rename_on_call: Some(3),
+                rename_calls: Arc::new(AtomicU64::new(0)),
+            },
+            ..reloader.clone()
+        };
+        let result = apply_candidate(&failing_reloader, UPDATED_APPLY_CONFIG.to_string()).await;
+        let error = result.expect_err("publication and rollback should fail");
+        assert!(
+            error.contains("ROLLBACK FAILED"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("config=Err"),
+            "config restore failure missing: {error}"
+        );
+        // Backup restoration still succeeds; current config remains the new generation because
+        // the injected failure blocked its atomic restore rename, which is reported explicitly.
+        assert_eq!(std::fs::read(&backup_path).unwrap(), old_backup);
+        let _ = dir;
     }
 }
