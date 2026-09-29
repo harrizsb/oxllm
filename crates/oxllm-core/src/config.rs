@@ -187,6 +187,59 @@ weight = 3"#,
     }
 
     #[test]
+    fn virtual_model_target_rejects_zero_weight() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = "http://127.0.0.1:4318"
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+
+            [virtual_models]
+            dual = [
+                { provider = "provider-a", model = "model-a", weight = 0 },
+            ]
+            "#,
+        )
+        .unwrap();
+
+        let err = config.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("positive weight"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn config_without_virtual_models_section_parses() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = "http://127.0.0.1:4318"
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.virtual_models.is_empty());
+    }
+
+    #[test]
     fn test_expand_env_vars_success() {
         std::env::set_var("TEST_HOST", "127.0.0.1");
         std::env::set_var("TEST_KEY", "groq-key-123");
