@@ -18,6 +18,8 @@ use axum::{
 use tower_http::cors::{Any, CorsLayer};
 
 use oxllm_core::config::Config;
+#[cfg(test)]
+use oxllm_core::runtime::RequestLogEntry;
 use oxllm_core::runtime::RuntimeMetrics;
 use oxllm_core::state::{AppState, CircuitState, ProviderState};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryWorker};
@@ -146,8 +148,11 @@ enum ProviderCommand {
 pub struct ReloadIo {
     /// When Some, the temp-file flush+sync step returns this error.
     pub fail_sync: Option<String>,
-    /// When Some, the config rename (commit) step returns this error.
+    /// When Some, every rename returns this error.
     pub fail_rename: Option<String>,
+    /// When Some, only this 1-based rename call returns the injected error.
+    pub fail_rename_on_call: Option<u64>,
+    rename_calls: Arc<AtomicU64>,
 }
 
 impl ReloadIo {
@@ -183,8 +188,12 @@ impl ReloadIo {
     }
 
     async fn rename(&self, from: &Path, to: &Path) -> std::result::Result<(), String> {
+        let call = self.rename_calls.fetch_add(1, Ordering::Relaxed) + 1;
         if let Some(message) = &self.fail_rename {
             return Err(message.clone());
+        }
+        if self.fail_rename_on_call == Some(call) {
+            return Err(format!("injected rename failure at call {call}"));
         }
         tokio::fs::rename(from, to).await.map_err(|e| {
             format!(
@@ -525,6 +534,18 @@ async fn atomic_restore(io: &ReloadIo, destination: &Path, bytes: &[u8]) -> Resu
     }
 }
 
+async fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let parent = parent.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        std::fs::File::open(&parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| format!("failed to sync directory {}: {error}", parent.display()))
+    })
+    .await
+    .map_err(|error| format!("directory sync task failed: {error}"))?
+}
+
 async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'static str>, String> {
     let old_raw = tokio::fs::read(&reloader.config_path)
         .await
@@ -571,31 +592,35 @@ async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'stati
         let _ = tokio::fs::remove_file(&backup_temp).await;
         return Err(format!("failed to replace backup: {error}"));
     }
-    if let Err(error) = reloader
-        .io
-        .rename(&config_temp, &reloader.config_path)
-        .await
-    {
+    let commit_result = async {
+        reloader
+            .io
+            .rename(&config_temp, &reloader.config_path)
+            .await?;
+        sync_parent_directory(&reloader.config_path).await
+    }
+    .await;
+    if let Err(error) = commit_result {
         let _ = tokio::fs::remove_file(&config_temp).await;
-        let restore_backup = match old_backup {
-            Some(bytes) => atomic_restore(&ReloadIo::default(), &old_backup_path, &bytes).await,
+        let config_restore = atomic_restore(&reloader.io, &reloader.config_path, &old_raw).await;
+        let backup_restore = match old_backup {
+            Some(bytes) => atomic_restore(&reloader.io, &old_backup_path, &bytes).await,
             None => tokio::fs::remove_file(&old_backup_path)
                 .await
                 .map_err(|e| format!("failed to remove new backup: {e}")),
         };
-        return match restore_backup {
-            Ok(()) => Err(format!("failed to replace config: {error}")),
-            Err(restore_error) => Err(format!(
-                "failed to replace config: {error}; FAILED TO RESTORE PREVIOUS BACKUP: {restore_error}"
+        return match (config_restore, backup_restore) {
+            (Ok(()), Ok(())) => Err(format!("failed to commit config: {error}; previous files restored")),
+            (config_result, backup_result) => Err(format!(
+                "failed to commit config: {error}; ROLLBACK FAILED: config={config_result:?}, backup={backup_result:?}"
             )),
         };
     }
 
     if reloader.sender.send(Arc::new(candidate.state)).is_err() {
-        let config_restore =
-            atomic_restore(&ReloadIo::default(), &reloader.config_path, &old_raw).await;
+        let config_restore = atomic_restore(&reloader.io, &reloader.config_path, &old_raw).await;
         let backup_restore = match old_backup {
-            Some(bytes) => atomic_restore(&ReloadIo::default(), &old_backup_path, &bytes).await,
+            Some(bytes) => atomic_restore(&reloader.io, &old_backup_path, &bytes).await,
             None => tokio::fs::remove_file(&old_backup_path)
                 .await
                 .map_err(|e| format!("failed to remove new backup: {e}")),
@@ -3760,5 +3785,436 @@ mod apply_tests {
             clone.reload_lock.try_lock().is_ok(),
             "Once released, clone should be able to acquire the reload_lock"
         );
+    }
+}
+
+#[cfg(test)]
+mod apply_pipeline_tests {
+    use super::*;
+    use axum::body::Body;
+    use tower::util::ServiceExt;
+
+    const BASE_APPLY_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov1"
+enabled = true
+base_url = "http://127.0.0.1:1"
+api_key = "initial-secret"
+models = ["m1"]
+
+[virtual_models]
+vm1 = [{ provider = "prov1", model = "m1" }]
+"#;
+
+    const UPDATED_APPLY_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov2"
+enabled = true
+base_url = "http://127.0.0.1:2"
+api_key = "second-secret"
+models = ["m2"]
+
+[virtual_models]
+vm2 = [{ provider = "prov2", model = "m2" }]
+"#;
+
+    fn setup_apply_fixture(io: ReloadIo) -> (tempfile_dir::TempDirGuard, Reloader, axum::Router) {
+        let dir = tempfile_dir::TempDirGuard::new("oxllm-apply");
+        let config_path = dir.path.join("config.toml");
+        std::fs::write(&config_path, BASE_APPLY_CONFIG).expect("initial config write");
+
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let initial_config = Config::load_from_file(&config_path).expect("initial parse");
+        let initial_state =
+            build_app_state(initial_config, metrics.clone()).expect("initial state");
+        let (sender, receiver) = tokio::sync::watch::channel(Arc::new(initial_state));
+        let (tx, _rx) = tokio::sync::mpsc::channel(8);
+
+        let reloader = Reloader {
+            sender,
+            config_path,
+            metrics,
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io,
+        };
+        let reloadable_state = ReloadableState {
+            app_state: receiver,
+            telemetry: TelemetryClient::new(tx),
+            start_time: Instant::now(),
+            reloader: reloader.clone(),
+        };
+        let router = build_router(reloadable_state);
+        (dir, reloader, router)
+    }
+
+    mod tempfile_dir {
+        use std::path::PathBuf;
+        pub struct TempDirGuard {
+            pub path: PathBuf,
+        }
+        impl TempDirGuard {
+            pub fn new(prefix: &str) -> Self {
+                let id = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                let path =
+                    std::env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+                std::fs::create_dir_all(&path).expect("temp dir create");
+                Self { path }
+            }
+        }
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.path);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_success_swaps_config_writes_exact_backup_and_preserves_metrics() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        // Record initial metric state to verify continuity
+        // prompt=10, cached=4, completion=6 -> total_tokens = 16
+        reloader.metrics.daily_tokens.record_usage(10, 4, 6);
+        reloader.metrics.push_request(RequestLogEntry {
+            timestamp: 100,
+            model_requested: "prior-model".into(),
+            virtual_model: Some("prior-vm".into()),
+            provider: "prov1".into(),
+            cached_tokens: 4,
+            uncached_tokens: 6,
+            status_code: 200,
+        });
+
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("router response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 1. Config file is new bytes
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            UPDATED_APPLY_CONFIG
+        );
+        // 2. Backup file exists and holds EXACT old bytes
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        // 3. Active state was reloaded without restart
+        let active_state = reloader.sender.subscribe().borrow().clone();
+        assert_eq!(active_state.providers.len(), 1);
+        assert_eq!(active_state.providers[0].name, "prov2");
+        // 4. Metrics continuity preserved
+        assert_eq!(reloader.metrics.daily_tokens.snapshot().total_tokens, 16);
+        assert_eq!(reloader.metrics.recent_requests().len(), 1);
+        assert_eq!(
+            reloader.metrics.recent_requests()[0].model_requested,
+            "prior-model"
+        );
+
+        // 5. Second apply overwrites backup with the second config (one-generation)
+        const THIRD_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 8080
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov3"
+enabled = true
+base_url = "http://127.0.0.1:3"
+api_key = "third-secret"
+models = ["m3"]
+
+[virtual_models]
+vm3 = [{ provider = "prov3", model = "m3" }]
+"#;
+        let payload = serde_json::json!({ "config": THIRD_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("second apply");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            THIRD_CONFIG
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            UPDATED_APPLY_CONFIG,
+            "one-generation backup must hold the second config, not the original"
+        );
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_invalid_config_writes_nothing_and_preserves_old_state() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+
+        // Invalid TOML with unknown field
+        let bad_config = BASE_APPLY_CONFIG.to_string() + "\nbogus_field = 42\n";
+        let payload = serde_json::json!({ "config": bad_config })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        assert!(
+            !backup_path.exists(),
+            "No .bak file should be created on invalid apply"
+        );
+        let active = reloader.sender.subscribe().borrow().clone();
+        assert_eq!(active.providers[0].name, "prov1");
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_reports_restart_required_when_startup_fields_change() {
+        let (dir, _reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let changed = BASE_APPLY_CONFIG
+            .replace("port = 8080", "port = 9090")
+            .replace(
+                "otel_endpoint = \"http://127.0.0.1:4318\"",
+                "otel_endpoint = \"http://127.0.0.1:9999\"",
+            );
+        let payload = serde_json::json!({ "config": changed })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let val: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(val["applied"], serde_json::json!(true));
+        let restart = val["restart_required"].as_array().unwrap();
+        let items: Vec<&str> = restart.iter().filter_map(|v| v.as_str()).collect();
+        assert!(items.contains(&"server.port"));
+        assert!(items.contains(&"server.otel_endpoint"));
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn injected_temp_sync_failure_leaves_config_and_bak_untouched() {
+        let failing_io = ReloadIo {
+            fail_sync: Some("simulated sync write failure".into()),
+            fail_rename: None,
+            fail_rename_on_call: None,
+            rename_calls: Arc::new(AtomicU64::new(0)),
+        };
+        let (dir, reloader, router) = setup_apply_fixture(failing_io);
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert!(!backup_path.exists());
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn injected_rename_failure_restores_previous_backup_and_aborts() {
+        let (dir, reloader, _router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        std::fs::write(&backup_path, b"pre-existing-backup-exact-bytes").unwrap();
+
+        // Inject rename failure: backup rename succeeds, but config rename fails
+        let failing_reloader = Reloader {
+            io: ReloadIo {
+                fail_sync: None,
+                fail_rename: None,
+                fail_rename_on_call: Some(2),
+                rename_calls: Arc::new(AtomicU64::new(0)),
+            },
+            ..reloader.clone()
+        };
+        let reloadable_state = ReloadableState {
+            app_state: reloader.sender.subscribe(),
+            telemetry: TelemetryClient::new(tokio::sync::mpsc::channel(1).0),
+            start_time: Instant::now(),
+            reloader: failing_reloader,
+        };
+        let failing_router = build_router(reloadable_state);
+
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = failing_router
+            .oneshot(request)
+            .await
+            .expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Previous config and pre-existing backup must both be intact
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backup_path).unwrap(),
+            "pre-existing-backup-exact-bytes"
+        );
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn cross_origin_apply_is_rejected_before_any_write() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::ORIGIN, "http://evil.example")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Config untouched, no backup
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert!(!backup_path.exists());
+        let _ = dir;
+    }
+    #[tokio::test]
+    async fn publish_failure_triggers_atomic_rollback_and_preserves_old_state() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        drop(router);
+        // A sender with no live receivers forces publication to fail.
+        let (sender, receiver) =
+            tokio::sync::watch::channel(reloader.sender.subscribe().borrow().clone());
+        drop(receiver);
+        let failing_reloader = Reloader {
+            sender,
+            ..reloader.clone()
+        };
+        let reloadable_state = ReloadableState {
+            app_state: reloader.sender.subscribe(),
+            telemetry: TelemetryClient::new(tokio::sync::mpsc::channel(1).0),
+            start_time: Instant::now(),
+            reloader: failing_reloader,
+        };
+        let router = build_router(reloadable_state);
+
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Previous config restored atomically
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        // Pre-existing backup was absent; no lingering .bak left after rollback
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        assert!(!backup_path.exists());
+        let _ = dir;
     }
 }

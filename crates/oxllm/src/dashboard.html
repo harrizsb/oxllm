@@ -39,12 +39,13 @@ th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overf
 </table>
 <p id="updated" class="muted"></p>
 <h2>Configuration editor</h2>
-<p class="muted">Raw config.toml, including ${VAR} placeholders. Validate is a dry-run and never writes to disk.</p>
+<p class="muted">Raw config.toml, including ${VAR} placeholders. Validate is a dry-run; Apply saves an exact one-generation backup and reloads providers. Host, port, and telemetry endpoint changes require a service restart.</p>
 <section aria-label="Configuration editor">
 <label for="config-editor">config.toml</label>
 <textarea id="config-editor" rows="18" spellcheck="false" aria-label="Raw configuration"></textarea>
 <div class="editor-actions">
 <button id="validate-config" type="button">Validate</button>
+<button id="apply-config" type="button">Apply validated configuration</button>
 <button id="load-config" type="button">Reload raw config</button>
 </div>
 <p id="validate-status" class="muted" role="status"></p>
@@ -141,6 +142,32 @@ async function validateConfig() {
     errors.append(entry);
   }
 }
+async function applyConfig() {
+  const editor = document.querySelector('#config-editor');
+  const status = document.querySelector('#validate-status');
+  const errors = document.querySelector('#validate-errors');
+  errors.replaceChildren();
+  status.textContent = 'Applying configuration…';
+  const response = await fetch('/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: editor.value }),
+  });
+  const result = await response.json();
+  if (!response.ok || !result.applied) {
+    status.textContent = 'Apply failed. The active configuration was not changed; see diagnostics.';
+    const entry = document.createElement('li');
+    entry.textContent = result.error?.message || `Request failed (${response.status})`;
+    errors.append(entry);
+    return;
+  }
+  const restartFields = result.restart_required || [];
+  status.textContent = restartFields.length
+    ? `Applied providers and saved config. Restart required for: ${restartFields.join(', ')}.`
+    : 'Applied and reloaded successfully. A one-generation config.toml.bak was saved.';
+  await refresh();
+}
+document.querySelector('#apply-config').addEventListener('click', () => applyConfig().catch(error => { document.querySelector('#validate-status').textContent = `Apply failed: ${error.message}`; }));
 document.querySelector('#load-config').addEventListener('click', () => loadRawConfig().catch(error => { document.querySelector('#validate-status').textContent = `Load failed: ${error.message}`; }));
 document.querySelector('#validate-config').addEventListener('click', () => validateConfig().catch(error => { document.querySelector('#validate-status').textContent = `Validation failed: ${error.message}`; }));
 loadRawConfig().catch(error => { document.querySelector('#validate-status').textContent = `Load failed: ${error.message}`; });
