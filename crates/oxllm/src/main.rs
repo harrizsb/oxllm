@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use std::net::{IpAddr, SocketAddr};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
@@ -140,11 +140,72 @@ enum ProviderCommand {
     },
 }
 
+/// Filesystem operations used by the Apply pipeline. Injected so tests can
+/// stage deterministic write/sync/rename/rollback failures (story e01s03).
+#[derive(Clone, Default)]
+pub struct ReloadIo {
+    /// When Some, the temp-file flush+sync step returns this error.
+    pub fail_sync: Option<String>,
+    /// When Some, the config rename (commit) step returns this error.
+    pub fail_rename: Option<String>,
+}
+
+impl ReloadIo {
+    async fn write_tmp_and_sync(
+        &self,
+        path: &Path,
+        bytes: &[u8],
+        permissions: Option<std::fs::Permissions>,
+    ) -> std::result::Result<(), String> {
+        if let Some(message) = &self.fail_sync {
+            return Err(message.clone());
+        }
+        tokio::task::spawn_blocking({
+            let path = path.to_path_buf();
+            let bytes = bytes.to_vec();
+            move || {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&path)
+                    .map_err(|e| format!("failed to create temp file {}: {}", path.display(), e))?;
+                if let Some(perms) = permissions {
+                    file.set_permissions(perms)
+                        .map_err(|e| format!("failed to set temp file permissions: {}", e))?;
+                }
+                file.write_all(&bytes)
+                    .map_err(|e| format!("failed to write temp file: {}", e))?;
+                file.sync_all()
+                    .map_err(|e| format!("failed to sync temp file: {}", e))?;
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|e| format!("temp write task failed: {}", e))?
+    }
+
+    async fn rename(&self, from: &Path, to: &Path) -> std::result::Result<(), String> {
+        if let Some(message) = &self.fail_rename {
+            return Err(message.clone());
+        }
+        tokio::fs::rename(from, to).await.map_err(|e| {
+            format!(
+                "failed to rename {} to {}: {}",
+                from.display(),
+                to.display(),
+                e
+            )
+        })
+    }
+}
+
 #[derive(Clone)]
 pub struct Reloader {
     sender: tokio::sync::watch::Sender<Arc<AppState>>,
     config_path: PathBuf,
     metrics: Arc<RuntimeMetrics>,
+    /// Serializes HTTP reload, SIGHUP reload, and Apply (story e01s03).
+    pub reload_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Injectable filesystem operations for the Apply pipeline.
+    pub io: ReloadIo,
 }
 
 #[derive(Clone)]
@@ -366,9 +427,193 @@ async fn shutdown_signal() {
     let _ = std::fs::remove_file("/tmp/oxllm.pid");
 }
 
+struct CandidateConfig {
+    raw: String,
+    config: Config,
+    state: AppState,
+}
+
+#[derive(Debug)]
+struct CandidateError {
+    message: String,
+    line: Option<usize>,
+    col: Option<usize>,
+}
+
+impl std::fmt::Display for CandidateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+fn build_config_candidate(
+    raw: String,
+    metrics: Arc<RuntimeMetrics>,
+) -> Result<CandidateConfig, CandidateError> {
+    let expanded = oxllm_core::config::expand_env_vars(&raw).map_err(|error| CandidateError {
+        message: error.to_string(),
+        line: None,
+        col: None,
+    })?;
+    let config: Config = toml::from_str(&expanded).map_err(|error: toml::de::Error| {
+        let approximate = expanded != raw;
+        let suffix = if approximate {
+            " (location is approximate because ${VAR} placeholders were expanded)"
+        } else {
+            ""
+        };
+        let (line, col) = error.span().map_or((None, None), |span| {
+            let prefix = &expanded[..span.start.min(expanded.len())];
+            (
+                Some(prefix.lines().count().max(1)),
+                Some(prefix.lines().last().map_or(1, |line| line.len() + 1)),
+            )
+        });
+        CandidateError {
+            message: format!("{error}{suffix}"),
+            line,
+            col,
+        }
+    })?;
+    config.validate().map_err(|error| CandidateError {
+        message: error.to_string(),
+        line: None,
+        col: None,
+    })?;
+    let state = build_app_state(config.clone(), metrics).map_err(|message| CandidateError {
+        message,
+        line: None,
+        col: None,
+    })?;
+    Ok(CandidateConfig { raw, config, state })
+}
+
+static APPLY_TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn sibling_temp_path(path: &Path, label: &str) -> PathBuf {
+    let id = APPLY_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("config");
+    path.with_file_name(format!(".{name}.{label}.{}.{}", std::process::id(), id))
+}
+
+async fn stage_synced_file(
+    io: &ReloadIo,
+    destination: &Path,
+    bytes: &[u8],
+    permissions: Option<std::fs::Permissions>,
+) -> Result<PathBuf, String> {
+    let temp = sibling_temp_path(destination, "tmp");
+    io.write_tmp_and_sync(&temp, bytes, permissions).await?;
+    Ok(temp)
+}
+
+async fn atomic_restore(io: &ReloadIo, destination: &Path, bytes: &[u8]) -> Result<(), String> {
+    let permissions = tokio::fs::metadata(destination)
+        .await
+        .ok()
+        .map(|m| m.permissions());
+    let temp = stage_synced_file(io, destination, bytes, permissions).await?;
+    match io.rename(&temp, destination).await {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&temp).await;
+            Err(error)
+        },
+    }
+}
+
+async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'static str>, String> {
+    let old_raw = tokio::fs::read(&reloader.config_path)
+        .await
+        .map_err(|e| format!("failed to read existing config: {e}"))?;
+    let old_config = Config::load_from_file(&reloader.config_path).map_err(|e| e.to_string())?;
+    let old_backup_path = reloader.config_path.with_extension("toml.bak");
+    let old_backup = match tokio::fs::read(&old_backup_path).await {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("failed to read existing backup: {error}")),
+    };
+    let permissions = tokio::fs::metadata(&reloader.config_path)
+        .await
+        .map_err(|e| format!("failed to read config permissions: {e}"))?
+        .permissions();
+
+    // Parse, expand, validate, and build before any filesystem mutation.
+    let candidate =
+        build_config_candidate(raw, reloader.metrics.clone()).map_err(|error| error.to_string())?;
+    let mut restart_required = Vec::new();
+    if old_config.server.host != candidate.config.server.host {
+        restart_required.push("server.host");
+    }
+    if old_config.server.port != candidate.config.server.port {
+        restart_required.push("server.port");
+    }
+    if old_config.server.otel_endpoint != candidate.config.server.otel_endpoint {
+        restart_required.push("server.otel_endpoint");
+    }
+
+    let config_temp = stage_synced_file(
+        &reloader.io,
+        &reloader.config_path,
+        candidate.raw.as_bytes(),
+        Some(permissions),
+    )
+    .await?;
+    let backup_temp = stage_synced_file(&reloader.io, &old_backup_path, &old_raw, None).await?;
+
+    // Install the new one-generation backup first. Until the config rename
+    // commits, failures restore the previous backup exactly.
+    if let Err(error) = reloader.io.rename(&backup_temp, &old_backup_path).await {
+        let _ = tokio::fs::remove_file(&config_temp).await;
+        let _ = tokio::fs::remove_file(&backup_temp).await;
+        return Err(format!("failed to replace backup: {error}"));
+    }
+    if let Err(error) = reloader
+        .io
+        .rename(&config_temp, &reloader.config_path)
+        .await
+    {
+        let _ = tokio::fs::remove_file(&config_temp).await;
+        let restore_backup = match old_backup {
+            Some(bytes) => atomic_restore(&ReloadIo::default(), &old_backup_path, &bytes).await,
+            None => tokio::fs::remove_file(&old_backup_path)
+                .await
+                .map_err(|e| format!("failed to remove new backup: {e}")),
+        };
+        return match restore_backup {
+            Ok(()) => Err(format!("failed to replace config: {error}")),
+            Err(restore_error) => Err(format!(
+                "failed to replace config: {error}; FAILED TO RESTORE PREVIOUS BACKUP: {restore_error}"
+            )),
+        };
+    }
+
+    if reloader.sender.send(Arc::new(candidate.state)).is_err() {
+        let config_restore =
+            atomic_restore(&ReloadIo::default(), &reloader.config_path, &old_raw).await;
+        let backup_restore = match old_backup {
+            Some(bytes) => atomic_restore(&ReloadIo::default(), &old_backup_path, &bytes).await,
+            None => tokio::fs::remove_file(&old_backup_path)
+                .await
+                .map_err(|e| format!("failed to remove new backup: {e}")),
+        };
+        return match (config_restore, backup_restore) {
+            (Ok(()), Ok(())) => Err("state publication failed; previous config and backup restored".into()),
+            (config_result, backup_result) => Err(format!(
+                "state publication failed; rollback errors: config={config_result:?}, backup={backup_result:?}"
+            )),
+        };
+    }
+    Ok(restart_required)
+}
+
 async fn handle_http_reload(
     axum::extract::State(reloader): axum::extract::State<Reloader>,
 ) -> impl IntoResponse {
+    let _reload_guard = reloader.reload_lock.lock().await;
     let config = match Config::load_from_file(&reloader.config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -463,6 +708,7 @@ async fn handle_sighup(
     config_path: PathBuf,
     watch_sender: tokio::sync::watch::Sender<Arc<AppState>>,
     metrics: Arc<RuntimeMetrics>,
+    reload_lock: Arc<tokio::sync::Mutex<()>>,
 ) {
     #[cfg(unix)]
     {
@@ -477,6 +723,7 @@ async fn handle_sighup(
 
         info!("Registered SIGHUP reload listener");
         while sig.recv().await.is_some() {
+            let _reload_guard = reload_lock.lock().await;
             info!("SIGHUP received, reloading configuration...");
             match Config::load_from_file(&config_path) {
                 Ok(new_config) => {
@@ -653,67 +900,88 @@ struct ValidateResponse {
     errors: Vec<ValidationErrorItem>,
 }
 
-/// Dry-runs parse -> expand_env_vars -> strict Config::validate -> build_app_state.
-fn validate_config_candidate(
-    raw_content: &str,
-    metrics: Arc<RuntimeMetrics>,
-) -> std::result::Result<(), (String, Option<usize>, Option<usize>)> {
-    let expanded = match oxllm_core::config::expand_env_vars(raw_content) {
-        Ok(expanded) => expanded,
-        Err(e) => return Err((e.to_string(), None, None)),
-    };
-    let config: Config = match toml::from_str(&expanded) {
-        Ok(c) => c,
-        Err(e) => {
-            // Spans point into the expanded text; when ${VAR} placeholders
-            // changed the offsets the reported location is approximate.
-            let approximates = expanded != raw_content;
-            let note = if approximates {
-                " (location is approximate because ${VAR} placeholders were expanded)"
-            } else {
-                ""
-            };
-            let (line, col) = e.span().map_or((None, None), |span| {
-                let prefix = &expanded[..span.start.min(expanded.len())];
-                let line = prefix.lines().count().max(1);
-                let col = prefix.lines().last().map_or(1, |l| l.len() + 1);
-                (Some(line), Some(col))
-            });
-            return Err((format!("{e}{note}"), line, col));
-        },
-    };
-    if let Err(e) = config.validate() {
-        return Err((e.to_string(), None, None));
-    }
-    if let Err(e) = build_app_state(config, metrics) {
-        return Err((e, None, None));
-    }
-    Ok(())
-}
-
 /// POST /validate — dry-run validator, performs zero writes.
 async fn handle_post_validate(
     axum::extract::State(reloader): axum::extract::State<Reloader>,
     axum::Extension(request_id): axum::Extension<String>,
     axum::Json(payload): axum::Json<ValidateRequest>,
 ) -> (StatusCode, axum::Json<ValidateResponse>) {
-    match validate_config_candidate(&payload.config, reloader.metrics.clone()) {
-        Ok(()) => (
+    match build_config_candidate(payload.config, reloader.metrics.clone()) {
+        Ok(_candidate) => (
             StatusCode::OK,
             axum::Json(ValidateResponse {
                 valid: true,
                 errors: vec![],
             }),
         ),
-        Err((message, line, col)) => {
+        Err(error) => {
             warn!(request_id = %request_id, "Config dry-run validation failed");
             (
                 StatusCode::BAD_REQUEST,
                 axum::Json(ValidateResponse {
                     valid: false,
-                    errors: vec![ValidationErrorItem { message, line, col }],
+                    errors: vec![ValidationErrorItem {
+                        message: error.message,
+                        line: error.line,
+                        col: error.col,
+                    }],
                 }),
             )
+        },
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApplyRequest {
+    config: String,
+}
+
+#[derive(serde::Serialize)]
+struct ApplyResponse {
+    applied: bool,
+    restart_required: Vec<&'static str>,
+}
+
+async fn handle_post_apply(
+    axum::extract::State(reloader): axum::extract::State<Reloader>,
+    axum::Extension(request_id): axum::Extension<String>,
+    axum::Json(payload): axum::Json<ApplyRequest>,
+) -> Response {
+    let _guard = reloader.reload_lock.lock().await;
+    match apply_candidate(&reloader, payload.config).await {
+        Ok(restart_required) => {
+            info!(request_id = %request_id, ?restart_required, "Applied new configuration successfully");
+            let body = serde_json::to_vec(&ApplyResponse {
+                applied: true,
+                restart_required,
+            })
+            .unwrap_or_default();
+            let mut response = Response::new(Body::from(body));
+            *response.status_mut() = StatusCode::OK;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
+        },
+        Err(error) => {
+            warn!(request_id = %request_id, error = %error, "Apply rejected or failed");
+            let body = serde_json::json!({
+                "applied": false,
+                "error": {
+                    "message": error,
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            });
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            let mut response = Response::new(Body::from(bytes));
+            *response.status_mut() = StatusCode::BAD_REQUEST;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            response
         },
     }
 }
@@ -737,6 +1005,10 @@ fn build_router(reloadable_state: ReloadableState) -> axum::Router {
         .route(
             "/validate",
             post(handle_post_validate).layer(middleware::from_fn(require_same_origin)),
+        )
+        .route(
+            "/apply",
+            post(handle_post_apply).layer(middleware::from_fn(require_same_origin)),
         )
         .route("/reload", post(handle_http_reload))
         .route(
@@ -810,10 +1082,12 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
 
     // 5. Spawn SIGHUP listener
     let config_path_clone = config_path.clone();
+    let reload_lock = Arc::new(tokio::sync::Mutex::new(()));
     tokio::spawn(handle_sighup(
         config_path_clone,
         watch_sender.clone(),
         metrics.clone(),
+        reload_lock.clone(),
     ));
 
     // 6. Build Axum Router
@@ -822,6 +1096,8 @@ async fn run_serve(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error
         sender: watch_sender.clone(),
         config_path: config_path.clone(),
         metrics: metrics.clone(),
+        reload_lock: reload_lock.clone(),
+        io: ReloadIo::default(),
     };
     let reloadable_state = ReloadableState {
         app_state: watch_receiver,
@@ -1367,6 +1643,8 @@ mod integration_tests {
             sender: _watch_sender.clone(),
             config_path: PathBuf::from("config.toml"),
             metrics: Arc::new(RuntimeMetrics::default()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io: ReloadIo::default(),
         };
 
         let reloadable_state = ReloadableState {
@@ -1470,6 +1748,8 @@ mod integration_tests {
             sender: _watch_sender.clone(),
             config_path: PathBuf::from("config.toml"),
             metrics: Arc::new(RuntimeMetrics::default()),
+            reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io: ReloadIo::default(),
         };
 
         let reloadable_state = ReloadableState {
@@ -1665,6 +1945,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1803,6 +2085,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -1907,6 +2191,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
 
@@ -2033,6 +2319,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -2131,6 +2419,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -2221,6 +2511,8 @@ mod integration_tests {
                 sender: _ws.clone(),
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -2324,6 +2616,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         let router = axum::Router::new()
@@ -2486,6 +2780,8 @@ mod integration_tests {
                 sender: _ws,
                 config_path: PathBuf::from("."),
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         (app_state, rs)
@@ -3144,6 +3440,8 @@ models = ["model"]
                 sender: _ws,
                 config_path,
                 metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
             },
         };
         build_router(reloadable_state)
@@ -3445,6 +3743,7 @@ mod apply_tests {
             config_path: PathBuf::from("config.toml"),
             metrics: Arc::new(RuntimeMetrics::default()),
             reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+            io: ReloadIo::default(),
         };
         let clone = reloader.clone();
         let guard = reloader.reload_lock.try_lock();
