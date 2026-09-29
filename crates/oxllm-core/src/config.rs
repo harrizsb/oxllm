@@ -266,6 +266,76 @@ weight = 3"#,
         );
     }
 
+    fn valid_config_with_host(host: &str, bind_family: &str) -> Config {
+        toml::from_str(&format!(
+            r#"
+            [server]
+            host = "{host}"
+            port = 8080
+            otel_endpoint = "http://127.0.0.1:4318"
+            bind_family = "{bind_family}"
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_ipv4_host_and_default_bind_family() {
+        let config = valid_config_with_host("100.115.92.30", "ipv4");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_wildcard_host() {
+        let config = valid_config_with_host("0.0.0.0", "ipv4");
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("wildcard"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_ipv6_host_literal() {
+        let config = valid_config_with_host("2001:db8::1", "ipv4");
+        let err = config.validate().unwrap_err();
+        assert!(err.to_string().contains("IPv4"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn validate_rejects_non_ip_host() {
+        for host in ["example.com", "localhost", ""] {
+            let config = valid_config_with_host(host, "ipv4");
+            let err = config.validate().unwrap_err();
+            assert!(
+                err.to_string().contains("IPv4 address"),
+                "host {host}: unexpected: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_rejects_ipv6_bind_family_with_migration_hint() {
+        let config = valid_config_with_host("127.0.0.1", "ipv6");
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("bind_family"), "unexpected: {message}");
+        assert!(message.contains("host"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn validate_rejects_dual_bind_family_with_migration_hint() {
+        let config = valid_config_with_host("127.0.0.1", "dual");
+        let err = config.validate().unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("bind_family"), "unexpected: {message}");
+        assert!(message.contains("host"), "unexpected: {message}");
+    }
+
     #[test]
     fn test_expand_env_vars_unclosed() {
         let input = r#"api_key = "${UNCLOSED"#;
