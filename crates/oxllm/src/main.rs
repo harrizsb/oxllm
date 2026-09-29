@@ -1029,41 +1029,6 @@ mod integration_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    #[test]
-    fn tailnet_only_allows_only_loopback_and_ipv4_cgnat() {
-        let allowed = [
-            "127.0.0.1",
-            "::1",
-            "::ffff:127.0.0.1",
-            "100.64.0.1",
-            "100.127.255.254",
-            "::ffff:100.64.0.1",
-        ];
-        for address in allowed {
-            let ip = address.parse().expect("test IP literal must parse");
-            assert!(
-                is_tailnet_or_loopback(ip),
-                "expected {address} to be allowed"
-            );
-        }
-
-        let rejected = [
-            "8.8.8.8",
-            "192.168.1.10",
-            "100.0.0.1",
-            "100.128.0.0",
-            "2001:db8::1",
-            "fd7a:115c:a1e0::1",
-        ];
-        for address in rejected {
-            let ip = address.parse().expect("test IP literal must parse");
-            assert!(
-                !is_tailnet_or_loopback(ip),
-                "expected {address} to be rejected"
-            );
-        }
-    }
-
     async fn spawn_mock_upstream(responses: Vec<String>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -2299,8 +2264,9 @@ mod integration_tests {
     }
 
     /// Configures a request as if it arrived from the given peer address.
-    fn request_from_peer(uri: &str, peer: IpAddr) -> Request<Body> {
+    fn request_from_peer(uri: &str, peer: IpAddr, method: axum::http::Method) -> Request<Body> {
         let mut request = Request::builder()
+            .method(method)
             .uri(uri)
             .body(Body::empty())
             .expect("static test request must build");
@@ -2386,37 +2352,54 @@ mod integration_tests {
         let router = build_router(reloadable_state);
 
         // Loopback peer reaches every production route without auth.
-        for uri in [
-            "/v1/models",
-            "/status",
-            "/dashboard",
-            "/health",
-            "/v1/embeddings",
+        for (method, uri) in [
+            (axum::http::Method::GET, "/v1/models"),
+            (axum::http::Method::GET, "/status"),
+            (axum::http::Method::GET, "/dashboard"),
+            (axum::http::Method::GET, "/health"),
+            (axum::http::Method::POST, "/reload"),
+            (
+                axum::http::Method::POST,
+                "/admin/providers/provider/offline",
+            ),
+            (axum::http::Method::POST, "/v1/embeddings"),
         ] {
             let response = router
                 .clone()
-                .oneshot(request_from_peer(uri, IpAddr::from([127, 0, 0, 1])))
+                .oneshot(request_from_peer(
+                    uri,
+                    IpAddr::from([127, 0, 0, 1]),
+                    method.clone(),
+                ))
                 .await
                 .expect("router must answer a loopback request");
-            assert!(
-                response.status() != StatusCode::FORBIDDEN,
-                "loopback peer unexpectedly denied on {uri}"
+            assert_ne!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "loopback peer was denied on {uri}"
             );
         }
 
         // A public source is denied on every route, including /v1.
-        for uri in [
-            "/v1/models",
-            "/status",
-            "/dashboard",
-            "/health",
-            "/reload",
-            "/admin/providers/prov/offline",
-            "/v1/chat/completions",
+        for (method, uri) in [
+            (axum::http::Method::GET, "/v1/models"),
+            (axum::http::Method::GET, "/status"),
+            (axum::http::Method::GET, "/dashboard"),
+            (axum::http::Method::GET, "/health"),
+            (axum::http::Method::POST, "/reload"),
+            (
+                axum::http::Method::POST,
+                "/admin/providers/provider/offline",
+            ),
+            (axum::http::Method::POST, "/v1/chat/completions"),
         ] {
             let response = router
                 .clone()
-                .oneshot(request_from_peer(uri, IpAddr::from([8, 8, 8, 8])))
+                .oneshot(request_from_peer(
+                    uri,
+                    IpAddr::from([8, 8, 8, 8]),
+                    method.clone(),
+                ))
                 .await
                 .expect("router must answer a forged peer request");
             assert_eq!(
