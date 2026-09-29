@@ -1,4 +1,5 @@
 use crate::config::VirtualModelTarget;
+use crate::runtime::RuntimeMetrics;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -73,6 +74,8 @@ pub struct AppState {
     pub virtual_models: HashMap<String, Vec<VirtualModelTarget>>,
     // One small cursor per virtual model keeps SWRR independent without expanding config state.
     pub swrr_current: Mutex<HashMap<String, Vec<i128>>>,
+    // Shared across config reloads so daily counters and the request log survive SIGHUP.
+    pub metrics: Arc<RuntimeMetrics>,
     pub http_client: reqwest::Client,
     pub upstream_timeout_secs: u64,
 }
@@ -138,6 +141,7 @@ mod swrr_tests {
     async fn app_state_resolution_distributes_by_target_weight() {
         use super::{AppState, CircuitState, ProviderState};
         use crate::config::VirtualModelTarget;
+        use crate::runtime::RuntimeMetrics;
         use reqwest::Url;
         use std::collections::HashMap;
         use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -182,6 +186,7 @@ mod swrr_tests {
             providers,
             virtual_models,
             swrr_current: Mutex::new(HashMap::new()),
+            metrics: std::sync::Arc::new(RuntimeMetrics::default()),
             http_client: reqwest::Client::new(),
             upstream_timeout_secs: 5,
         };

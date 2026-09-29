@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>oxllm dashboard</title>
+<style>
+:root { color-scheme: light dark; font: 16px/1.5 system-ui, sans-serif; }
+body { max-width: 960px; margin: 3rem auto; padding: 0 1rem; }
+h1 { margin-bottom: .25rem; }
+.muted { opacity: .7; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit,minmax(160px,1fr)); gap: 1rem; margin: 2rem 0; }
+.card { border: 1px solid #8886; border-radius: .5rem; padding: 1rem; }
+.card strong { display: block; font-size: 1.7rem; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overflow-wrap: anywhere; }
+@media (max-width: 600px) { table { font-size: .85rem; } th, td { padding: .4rem .2rem; } }
+</style>
+</head>
+<body>
+<h1>oxllm</h1>
+<p class="muted">Today's token usage and the three most recent requests. State is in memory and resets on restart.</p>
+<section class="cards" aria-label="Today's token usage">
+<div class="card">Cached tokens<strong id="cached">—</strong></div>
+<div class="card">Uncached tokens<strong id="uncached">—</strong></div>
+<div class="card">Total tokens<strong id="total">—</strong></div>
+</section>
+<h2>Recent requests</h2>
+<table>
+<thead><tr><th>Time</th><th>Requested model</th><th>Provider</th><th>Cached</th><th>Uncached</th><th>Status</th></tr></thead>
+<tbody id="requests"><tr><td colspan="6">Loading…</td></tr></tbody>
+</table>
+<p id="updated" class="muted"></p>
+<script>
+const number = value => Number(value || 0).toLocaleString();
+async function refresh() {
+  const response = await fetch('/status', { cache: 'no-store' });
+  if (!response.ok) throw new Error(`Request failed: ${response.status}`);
+  const data = await response.json();
+  document.querySelector('#cached').textContent = number(data.daily_tokens.cached_tokens);
+  document.querySelector('#uncached').textContent = number(data.daily_tokens.uncached_tokens);
+  document.querySelector('#total').textContent = number(data.daily_tokens.total_tokens);
+  const body = document.querySelector('#requests');
+  body.replaceChildren();
+  if (!data.recent_requests.length) {
+    const row = body.insertRow(); const cell = row.insertCell(); cell.colSpan = 6; cell.textContent = 'No requests yet';
+  }
+  for (const request of data.recent_requests) {
+    const row = body.insertRow();
+    const values = [new Date(request.timestamp * 1000).toLocaleString(), request.model_requested, request.provider,
+      number(request.cached_tokens), number(request.uncached_tokens), request.status_code];
+    for (const value of values) row.insertCell().textContent = value;
+  }
+  document.querySelector('#updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
+}
+refresh().catch(error => { document.querySelector('#updated').textContent = error.message; });
+setInterval(() => refresh().catch(() => {}), 5000);
+</script>
+</body>
+</html>

@@ -1,3 +1,4 @@
+use axum::response::Html;
 use axum::{
     body::Body,
     extract::{Extension, State},
@@ -10,12 +11,47 @@ use futures_util::{stream::unfold, StreamExt};
 use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, warn};
 
 use oxllm_core::router::{AdaptivePriorityStrategy, RoutingStrategy};
+use oxllm_core::runtime::{DailyTokenSnapshot, RequestLogEntry};
 use oxllm_core::state::{AppState, CircuitState, ProviderState};
 use oxllm_core::telemetry::{TelemetryClient, TelemetryEvent};
+
+/// GET /dashboard — read-only usage dashboard, embedded at compile time (no build step).
+pub async fn dashboard() -> Html<&'static str> {
+    Html(include_str!("dashboard.html"))
+}
+
+/// Records one finished client request into the last-3 ring buffer.
+/// The fields are exactly those the handoff lists; no analytics extras.
+fn log_request(
+    app_state: &AppState,
+    requested_model: &str,
+    provider: &str,
+    cached: u64,
+    uncached: u64,
+    status: u16,
+) {
+    let virtual_model = if app_state.virtual_models.contains_key(requested_model) {
+        Some(requested_model.to_string())
+    } else {
+        None
+    };
+    app_state.metrics.push_request(RequestLogEntry {
+        timestamp: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        model_requested: requested_model.to_string(),
+        virtual_model,
+        provider: provider.to_string(),
+        cached_tokens: cached,
+        uncached_tokens: uncached,
+        status_code: status,
+    });
+}
 
 #[derive(Serialize)]
 struct ModelObject {
@@ -114,6 +150,8 @@ pub async fn get_status(
         total_requests: u64,
         providers: Vec<ProviderStatus>,
         virtual_models: std::collections::HashMap<String, Vec<RouteEntry>>,
+        daily_tokens: DailyTokenSnapshot,
+        recent_requests: Vec<RequestLogEntry>,
     }
 
     let mut status_list = Vec::new();
@@ -227,11 +265,15 @@ pub async fn get_status(
         virtual_models.insert(vm_name.clone(), entries);
     }
 
+    let mut recent_requests = app_state.metrics.recent_requests();
+    recent_requests.reverse(); // newest first, matching the dashboard feed
     Json(StatusResponse {
         uptime_secs: start_time.elapsed().as_secs(),
         total_requests,
         providers: status_list,
         virtual_models,
+        daily_tokens: app_state.metrics.daily_tokens.snapshot(),
+        recent_requests,
     })
 }
 
@@ -254,7 +296,7 @@ pub async fn create_embeddings(
     };
 
     let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
-        Some(m) => m,
+        Some(m) => m.to_string(),
         None => {
             return json_error_response(
                 "Missing required 'model' field",
@@ -264,8 +306,9 @@ pub async fn create_embeddings(
         },
     };
 
-    let candidates = app_state.resolve_candidates(requested_model).await;
+    let candidates = app_state.resolve_candidates(&requested_model).await;
     if candidates.is_empty() {
+        log_request(&app_state, &requested_model, "", 0, 0, 400);
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
             "invalid_request_error",
@@ -379,21 +422,43 @@ pub async fn create_embeddings(
                     },
                 };
 
-                // Parse token counts from upstream response
-                let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
-                    .map(|v| {
-                        let usage = v.get("usage");
-                        let input = usage
-                            .and_then(|u| u.get("prompt_tokens"))
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        let output = usage
-                            .and_then(|u| u.get("completion_tokens"))
-                            .and_then(|t| t.as_u64())
-                            .unwrap_or(0);
-                        (input, output)
-                    })
-                    .unwrap_or((0, 0));
+                // Parse token counts from upstream response, including cached prompt tokens
+                let (input_tokens, output_tokens, cached_tokens) =
+                    serde_json::from_slice::<Value>(&res_body)
+                        .map(|v| {
+                            let usage = v.get("usage");
+                            let input = usage
+                                .and_then(|u| u.get("prompt_tokens"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .and_then(|u| u.get("completion_tokens"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let cached = usage
+                                .and_then(|u| u.get("prompt_tokens_details"))
+                                .and_then(|d| d.get("cached_tokens"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            (input, output, cached)
+                        })
+                        .unwrap_or((0, 0, 0));
+
+                // Daily accounting + request log
+                let uncached_tokens = input_tokens.saturating_sub(cached_tokens);
+                app_state.metrics.daily_tokens.record_usage(
+                    input_tokens,
+                    cached_tokens,
+                    output_tokens,
+                );
+                log_request(
+                    &app_state,
+                    &requested_model,
+                    &selected.name,
+                    cached_tokens,
+                    uncached_tokens,
+                    status_code,
+                );
 
                 // Report Success feedback
                 let target_provider_state = app_state
@@ -526,6 +591,14 @@ pub async fn create_embeddings(
         }
     }
 
+    log_request(
+        &app_state,
+        &requested_model,
+        &last_failed_provider,
+        0,
+        0,
+        502,
+    );
     let message = if !last_upstream_error.is_empty() {
         format!(
             "All upstream embeddings providers failed or are rate-limited. Last error from {} ({}): {}",
@@ -556,7 +629,7 @@ pub async fn create_chat_completions(
     };
 
     let requested_model = match payload.get("model").and_then(|m| m.as_str()) {
-        Some(m) => m,
+        Some(m) => m.to_string(),
         None => {
             return json_error_response(
                 "Missing required 'model' field",
@@ -566,8 +639,9 @@ pub async fn create_chat_completions(
         },
     };
 
-    let candidates = app_state.resolve_candidates(requested_model).await;
+    let candidates = app_state.resolve_candidates(&requested_model).await;
     if candidates.is_empty() {
+        log_request(&app_state, &requested_model, "", 0, 0, 400);
         return json_error_response(
             &format!("Invalid or unmapped virtual model: {}", requested_model),
             "invalid_request_error",
@@ -744,6 +818,11 @@ pub async fn create_chat_completions(
                         });
                     });
 
+                    // TODO(streaming): SSE carriers `usage` in the final chunk; parse the
+                    // stream to feed daily token accounting. Logged with zeros for now
+                    // (per handoff: non-streaming first, no silent breakage).
+                    log_request(&app_state, &requested_model, &selected.name, 0, 0, 200);
+
                     // Convert mpsc receiver to a Stream for axum
                     let axum_stream = unfold(Some(rx), |state| async move {
                         let mut rx = state?;
@@ -799,21 +878,44 @@ pub async fn create_chat_completions(
                         },
                     };
 
-                    // Parse token counts from upstream response
-                    let (input_tokens, output_tokens) = serde_json::from_slice::<Value>(&res_body)
-                        .map(|v| {
-                            let usage = v.get("usage");
-                            let input = usage
-                                .and_then(|u| u.get("prompt_tokens"))
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            let output = usage
-                                .and_then(|u| u.get("completion_tokens"))
-                                .and_then(|t| t.as_u64())
-                                .unwrap_or(0);
-                            (input, output)
-                        })
-                        .unwrap_or((0, 0));
+                    // Parse token counts from upstream response, including cached
+                    // prompt tokens (providers that omit the details field count as zero).
+                    let (input_tokens, output_tokens, cached_tokens) =
+                        serde_json::from_slice::<Value>(&res_body)
+                            .map(|v| {
+                                let usage = v.get("usage");
+                                let input = usage
+                                    .and_then(|u| u.get("prompt_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let output = usage
+                                    .and_then(|u| u.get("completion_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                let cached = usage
+                                    .and_then(|u| u.get("prompt_tokens_details"))
+                                    .and_then(|d| d.get("cached_tokens"))
+                                    .and_then(|t| t.as_u64())
+                                    .unwrap_or(0);
+                                (input, output, cached)
+                            })
+                            .unwrap_or((0, 0, 0));
+
+                    // Daily accounting + request log (non-streaming only: see TODO below)
+                    let uncached_tokens = input_tokens.saturating_sub(cached_tokens);
+                    app_state.metrics.daily_tokens.record_usage(
+                        input_tokens,
+                        cached_tokens,
+                        output_tokens,
+                    );
+                    log_request(
+                        &app_state,
+                        &requested_model,
+                        &selected.name,
+                        cached_tokens,
+                        uncached_tokens,
+                        status_code,
+                    );
 
                     // Increment local counters
                     target_provider_state
@@ -926,6 +1028,14 @@ pub async fn create_chat_completions(
         }
     }
 
+    log_request(
+        &app_state,
+        &requested_model,
+        &last_failed_provider,
+        0,
+        0,
+        502,
+    );
     let message = if !last_upstream_error.is_empty() {
         format!(
             "All upstream chat completions providers failed or are rate-limited. Last error from {} ({}): {}",
