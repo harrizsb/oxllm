@@ -229,3 +229,31 @@ Things that will bite you.
 - Prefer the smallest diff that satisfies the requirement.
 - Do not refactor existing code unless the new feature requires it.
 - If you find a real bug in existing code, note it. Do not silently fix it in the same change.
+
+
+---
+
+## Amendment A1 — tailscale-only exposure and dashboard config editor (2026-09-29, revision 2)
+
+Recorded after the original handoff's features shipped and merged (PR #1). User-directed; supersedes specific rules above. Everything not listed here stays binding. Revision 2 replaces the earlier draft of this amendment (public bind + client key + IP allowlist), which was superseded during design review before any code was written.
+
+**Deployment context change.** oxllm runs as the only gateway service on a small VPS. All access — dashboard and `/v1/*` — is over a Tailscale tailnet. Tailscale membership is the single trust boundary: no client key, no IP allowlist in oxllm, no dashboard password, no sessions, no lockout, no TLS termination in oxllm (WireGuard encrypts the tailnet).
+
+**Superseded rules:**
+
+- §3 "No disk writes at runtime" — partially superseded. oxllm gains exactly one write path: `config.toml.bak` (one generation) plus atomic replacement of `config.toml`, triggered only by an explicit dashboard Apply. No other files, ever.
+- §5 "No CRUD UI" and §6.2 "Dashboard is read-only" — superseded. The dashboard, reachable only from the tailnet, is treated as a trusted local terminal.
+- §3 "Keep it small" — the ~400-line budget no longer applies to this amendment; the spirit (no dependency bloat, minimal diff) does.
+- §5 "No auth, rate limiting" stays binding — confirmed twice: tailnet is the gate.
+
+**Network:** oxllm listens on exactly two addresses: the VPS's Tailscale address (from config `[server].host`) and `127.0.0.1` (loopback listener for local diagnostics and deploy smoke tests; always trusted). The VPS exposes no gateway port publicly; that is enforced outside oxllm (binding + host firewall), not by application logic.
+
+**Dashboard (tailnet + loopback only):** keeps its existing read-only views unchanged, plus:
+
+- A raw TOML editor over the full `config.toml` (values visible; `${VAR}` placeholders preserved as written). Validate runs parse + cross-reference checks (existing `Config::validate`, unknown-field rejection) without writing; Apply = validate → write `config.toml.bak` → atomic replace → in-process reload. Invalid config: 400 with diagnostics, nothing written.
+- No client-key controls, no key generation, no masking layer anywhere. Provider keys are edited through the raw editor like any other field. Key strength is not enforced: the owner may choose any TOML value.
+- Editing `[server]` settings from the dashboard is accepted risk; recovery path is SSH.
+
+**Explicitly out of scope (unchanged or re-confirmed):** multi-user/multi-tenant (permanently), passwords/sessions/login, TLS in oxllm, lockout/rate limiting, per-device access rules inside oxllm (tailnet ACLs handle that), key rotation logic (§6.3 stands), streaming token accounting (existing TODO).
+
+**Verification additions to §8:** dashboard and `/v1` reachable from the tailnet and from loopback; `/v1` keyless; Apply with invalid TOML leaves `config.toml` byte-identical and keeps serving; Apply with valid TOML swaps config without dropping in-memory metrics; after Apply, new config takes effect without process restart.

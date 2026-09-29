@@ -1,0 +1,19 @@
+# specs/release-plan.yaml — release index written during plan-release; WSJF ordering of epics
+release:
+  version: "mirror-only"      # non-authoritative; semantic-release decides at merge
+  codename: "tailscale-gateway-and-dashboard-config-editor"
+  status: planning
+  semantic_release: true
+  bump_hint: minor
+epics:
+  - id: e01
+    title: "Tailscale-only gateway with dashboard config editor"
+    wsjf: 4.8
+    capsule_dir: epics/e01-tailscale-gateway-editor
+    note: "Single-epic initiative from specs/product/SCOPE_LATEST.yaml; WSJF = (BV 9 + TC 7 + RR 8) / size 5. Story order below is execution order (dependency), not WSJF rank."
+bugs:
+  total: 0
+  fixed: 0
+  deferred: 0
+  wontfix: 0
+  registry: "specs/bugs/registry.yaml (not yet created; no known open bugs)"

@@ -1,0 +1,88 @@
+story_id: e01s02
+title: Raw config view + Validate dry-run on the dashboard
+status: todo
+bcps: 5
+tasks:
+- id: 1
+  description: Add deny_unknown_fields to Config, ServerConfig, ProviderConfig, and
+    VirtualModelTarget; extend Config::validate to reject unknown bind_family values,
+    non-IP/unspecified host, and malformed enabled-provider URLs; preserve valid existing
+    configs
+  verify: cargo test -p oxllm-core config_validation
+  risk: P0
+  status: failing
+  security: medium
+  allure:
+    severity: critical
+    categories: &id001
+    - integration
+    - config-validation
+- id: 2
+  description: Test all config structs reject unknown fields with the offending field
+    named; preserve serde defaults and parse the repository config.toml
+  verify: cargo test -p oxllm-core unknown_field && cargo run -- validate --config
+    config.toml
+  risk: P1
+  status: failing
+  security: low
+  allure:
+    severity: high
+    categories: *id001
+- id: 3
+  description: Add GET /config reading exact raw bytes from resolved Reloader.config_path
+    (no environment expansion); response text/plain and no-store; reject a present
+    cross-origin Origin (same-origin browser rule; allow Origin-absent non-browser
+    clients); test literal ${VAR} and secret values remain byte-identical and cross-origin
+    read is refused
+  verify: cargo test -p oxllm config_raw
+  risk: P1
+  status: failing
+  security: medium
+  allure:
+    severity: high
+    categories: *id001
+- id: 4
+  description: 'Add POST /validate accepting application/json {config: raw_toml};
+    reject present cross-origin Origin, allow absent Origin; run existing env expansion,
+    strict TOML parse, Config::validate and build_app_state so dry-run predicts apply;
+    return structured diagnostics incl parser span where supported; never write'
+  verify: cargo test -p oxllm validate_config
+  risk: P0
+  status: failing
+  security: medium
+  allure:
+    severity: critical
+    categories: *id001
+- id: 5
+  description: Test same-origin config read/validate succeeds and foreign Origin read/validate
+    is rejected; validate valid TOML, syntax error, unknown field, missing env var,
+    dangling virtual-model provider, zero target weight, malformed enabled-provider
+    base_url; assert file bytes and .bak unchanged for every case
+  verify: cargo test -p oxllm validate_config
+  risk: P0
+  status: failing
+  security: medium
+  allure:
+    severity: critical
+    categories: *id001
+- id: 6
+  description: Add dashboard full-file textarea populated from GET /config, Validate
+    button posting JSON, diagnostics renderer using textContent only; vanilla JS and
+    embedded include_str! unchanged
+  verify: cargo test -p oxllm dashboard && grep -q config-editor crates/oxllm/src/dashboard.html
+  risk: P1
+  status: failing
+  security: low
+  allure:
+    severity: high
+    categories: *id001
+- id: 7
+  description: Run repo gates
+  verify: cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings
+    && cargo test --workspace
+  risk: P1
+  status: failing
+  security: medium
+  allure:
+    severity: high
+    categories: *id001

@@ -1,0 +1,73 @@
+id: e01
+title: Tailscale-only gateway with dashboard config editor
+wsjf: 4.8
+total_bcps: 16
+status: in_progress
+stories:
+- id: e01s01
+  title: 'Tailnet reachability: dual bind + tailnet/loopback guard on all routes'
+  bcps: 5
+  status: todo
+  spec: e01s01-tailnet-reachability.md
+  tasks: e01s01-tasks.yaml
+  delta:
+  - type: MODIFIED
+    ref: localhost_only middleware
+    summary: 'Becomes tailnet_only: permits loopback + IPv4 100.64.0.0/10 (CGNAT),
+      403 otherwise; applied to ALL routes including /v1'
+  - type: MODIFIED
+    ref: server.bind_family
+    summary: Only ipv4 remains valid; ipv6/dual wildcard modes are rejected with a
+      migration diagnostic; [server].host is authoritative
+  - type: ADDED
+    ref: dual binding
+    summary: run_serve binds the configured IPv4-only [server].host plus a dedicated
+      127.0.0.1 listener on the same port; single bind when host is already loopback
+- id: e01s02
+  title: Raw config view + Validate dry-run on the dashboard
+  bcps: 5
+  status: todo
+  spec: e01s02-raw-config-validate.md
+  tasks: e01s02-tasks.yaml
+  delta:
+  - type: ADDED
+    ref: GET /config
+    summary: Returns config.toml raw bytes as written (no env expansion, ${VAR} preserved)
+      behind the tailnet guard
+  - type: ADDED
+    ref: POST /validate
+    summary: Dry-run parse + Config::validate + unknown-field rejection; structured
+      diagnostics with spans; never writes
+  - type: MODIFIED
+    ref: config structs
+    summary: deny_unknown_fields on ServerConfig/ProviderConfig/VirtualModelTarget/Config;
+      typo'd fields become errors on validate, serve, and reload paths
+  - type: MODIFIED
+    ref: dashboard.html
+    summary: 'Adds editor section: textarea prefilled from /config, Validate button,
+      diagnostics rendering (vanilla JS, still include_str!-embedded)'
+  - type: ADDED
+    ref: editor Origin checks
+    summary: GET /config and POST /validate reject a present cross-origin Origin,
+      preventing third-party pages in a tailnet-connected browser from reading config
+      secrets; no Origin is permitted for direct non-browser clients
+- id: e01s03
+  title: 'Apply: one-generation backup, atomic swap, in-process reload'
+  bcps: 6
+  status: todo
+  spec: e01s03-apply-pipeline.md
+  tasks: e01s03-tasks.yaml
+  delta:
+  - type: ADDED
+    ref: POST /apply
+    summary: Bounded application/json; same-origin Origin check when header present;
+      validate/build before backup; atomic replacement and in-process reload; invalid
+      input has zero writes
+  - type: MODIFIED
+    ref: dashboard.html
+    summary: Apply button with confirmation; disabled while in flight; success/failure
+      feedback
+  - type: MODIFIED
+    ref: CHANGELOG.md / docs
+    summary: '[Unreleased] entry and as-built addendum recording Amendment A1 rev
+      2'
