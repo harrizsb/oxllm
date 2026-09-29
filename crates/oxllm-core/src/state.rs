@@ -77,7 +77,6 @@ pub struct AppState {
     pub upstream_timeout_secs: u64,
 }
 
-
 impl AppState {
     /// Picks the SWRR target first, then keeps remaining targets as ordered failovers.
     /// Equal default weights preserve the existing target order over each complete cycle.
@@ -110,7 +109,6 @@ impl AppState {
     }
 }
 
-
 #[cfg(test)]
 mod swrr_tests {
     use super::next_swrr_index;
@@ -135,5 +133,69 @@ mod swrr_tests {
 
         assert_eq!(next_swrr_index(&weights, &mut current), 1);
     }
-}
 
+    #[tokio::test]
+    async fn app_state_resolution_distributes_by_target_weight() {
+        use super::{AppState, CircuitState, ProviderState};
+        use crate::config::VirtualModelTarget;
+        use reqwest::Url;
+        use std::collections::HashMap;
+        use std::sync::atomic::{AtomicBool, AtomicU64};
+        use std::sync::Arc;
+        use tokio::sync::{Mutex, RwLock};
+
+        let providers = ["provider-a", "provider-b"]
+            .into_iter()
+            .map(|name| ProviderState {
+                name: name.to_string(),
+                base_url: Url::parse("https://example.com").unwrap(),
+                api_key: "key".to_string(),
+                models: vec!["model".to_string()],
+                circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+                consecutive_failures: Arc::new(RwLock::new(0)),
+                rate_limited_until: Arc::new(RwLock::new(None)),
+                last_attempt_time: Arc::new(RwLock::new(None)),
+                probe_in_flight: Arc::new(AtomicBool::new(false)),
+                manual_disabled: AtomicBool::new(false),
+                requests: AtomicU64::new(0),
+                successes: AtomicU64::new(0),
+                tokens_input: AtomicU64::new(0),
+                tokens_output: AtomicU64::new(0),
+            })
+            .collect();
+        let virtual_models = HashMap::from([(
+            "balanced".to_string(),
+            vec![
+                VirtualModelTarget {
+                    provider: "provider-a".to_string(),
+                    model: "model-a".to_string(),
+                    weight: 2,
+                },
+                VirtualModelTarget {
+                    provider: "provider-b".to_string(),
+                    model: "model-b".to_string(),
+                    weight: 1,
+                },
+            ],
+        )]);
+        let app_state = AppState {
+            providers,
+            virtual_models,
+            swrr_current: Mutex::new(HashMap::new()),
+            http_client: reqwest::Client::new(),
+            upstream_timeout_secs: 5,
+        };
+
+        let mut counts = [0; 2];
+        for _ in 0..300 {
+            let candidates = app_state.resolve_candidates("balanced").await;
+            match candidates[0].0.name.as_str() {
+                "provider-a" => counts[0] += 1,
+                "provider-b" => counts[1] += 1,
+                other => panic!("unexpected selected provider: {other}"),
+            }
+        }
+
+        assert_eq!(counts, [200, 100]);
+    }
+}

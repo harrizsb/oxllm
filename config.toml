@@ -104,6 +104,10 @@ models = ["granite4.1:3b"]
 [virtual_models]
 # "smart" uses the best models available on the free tier,
 # then cascades to basic, and finally to local Ollama.
+#
+# Targets also accept an optional positive `weight` (default 1). Routing picks
+# targets with smooth weighted round-robin (SWRR); the remaining targets stay
+# ordered as fallbacks when a picked target's circuit is open or rate-limited.
 smart = [
   { provider = "groq-strong",     model = "llama-3.3-70b-versatile" },
   { provider = "sambanova-strong", model = "Llama-4-Maverick-17B-128E-Instruct" },

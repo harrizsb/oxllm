@@ -36,6 +36,7 @@ pub struct VirtualModelTarget {
 pub struct Config {
     pub server: ServerConfig,
     pub providers: Vec<ProviderConfig>,
+    #[serde(default)]
     pub virtual_models: HashMap<String, Vec<VirtualModelTarget>>,
 }
 

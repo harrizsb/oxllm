@@ -214,6 +214,23 @@ fn build_app_state(config: Config) -> Result<AppState, String> {
         });
     }
 
+    // Virtual models take precedence over provider model names; warn so shadowing is explicit.
+    for (virtual_name, targets) in &config.virtual_models {
+        if providers
+            .iter()
+            .any(|provider| provider.models.iter().any(|model| model == virtual_name))
+        {
+            warn!(
+                virtual_model = %virtual_name,
+                "Virtual model shadows a real provider model name; virtual model routing takes precedence"
+            );
+        }
+        if targets.is_empty() {
+            // Validation rejects this; retain a defensive startup diagnostic if state is built directly.
+            warn!(virtual_model = %virtual_name, "Virtual model has no routing targets");
+        }
+    }
+
     let http_client = reqwest::Client::builder()
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
