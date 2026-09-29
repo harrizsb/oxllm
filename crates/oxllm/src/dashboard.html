@@ -15,6 +15,10 @@ h1 { margin-bottom: .25rem; }
 table { width: 100%; border-collapse: collapse; }
 th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overflow-wrap: anywhere; }
 @media (max-width: 600px) { table { font-size: .85rem; } th, td { padding: .4rem .2rem; } }
+#config-editor { width: 100%; box-sizing: border-box; font: 13px/1.4 ui-monospace, monospace; white-space: pre; }
+.editor-actions { display: flex; gap: .5rem; margin: .5rem 0; }
+#validate-errors { color: #a33; padding-left: 1.2rem; }
+#validate-errors:empty { display: none; }
 </style>
 </head>
 <body>
@@ -34,6 +38,18 @@ th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overf
 <tbody id="requests"><tr><td colspan="6">Loading…</td></tr></tbody>
 </table>
 <p id="updated" class="muted"></p>
+<h2>Configuration editor</h2>
+<p class="muted">Raw config.toml, including ${VAR} placeholders. Validate is a dry-run and never writes to disk.</p>
+<section aria-label="Configuration editor">
+<label for="config-editor">config.toml</label>
+<textarea id="config-editor" rows="18" spellcheck="false" aria-label="Raw configuration"></textarea>
+<div class="editor-actions">
+<button id="validate-config" type="button">Validate</button>
+<button id="load-config" type="button">Reload raw config</button>
+</div>
+<p id="validate-status" class="muted" role="status"></p>
+<ul id="validate-errors" aria-label="Validation diagnostics"></ul>
+</section>
 <script>
 const number = value => Number(value || 0).toLocaleString();
 async function refresh() {
@@ -87,6 +103,47 @@ async function refresh() {
   }
   document.querySelector('#updated').textContent = `Updated ${new Date().toLocaleTimeString()}`;
 }
+async function loadRawConfig() {
+  const editor = document.querySelector('#config-editor');
+  const status = document.querySelector('#validate-status');
+  const errors = document.querySelector('#validate-errors');
+  errors.replaceChildren();
+  status.textContent = 'Loading raw config…';
+  const response = await fetch('/config', { cache: 'no-store' });
+  if (!response.ok) {
+    status.textContent = `Could not load raw config (${response.status})`;
+    return;
+  }
+  editor.value = await response.text();
+  status.textContent = 'Raw config loaded. ${VAR} placeholders are preserved.';
+}
+async function validateConfig() {
+  const editor = document.querySelector('#config-editor');
+  const status = document.querySelector('#validate-status');
+  const errors = document.querySelector('#validate-errors');
+  errors.replaceChildren();
+  status.textContent = 'Validating…';
+  const response = await fetch('/validate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ config: editor.value }),
+  });
+  const result = await response.json();
+  if (response.ok && result.valid) {
+    status.textContent = 'Valid: this config would pass the Apply preconditions.';
+    return;
+  }
+  status.textContent = 'Invalid: fix the diagnostics below. No files were changed.';
+  for (const item of result.errors || []) {
+    const entry = document.createElement('li');
+    const location = item.line ? ` (line ${item.line}, col ${item.col ?? 1})` : '';
+    entry.textContent = `${item.message}${location}`;
+    errors.append(entry);
+  }
+}
+document.querySelector('#load-config').addEventListener('click', () => loadRawConfig().catch(error => { document.querySelector('#validate-status').textContent = `Load failed: ${error.message}`; }));
+document.querySelector('#validate-config').addEventListener('click', () => validateConfig().catch(error => { document.querySelector('#validate-status').textContent = `Validation failed: ${error.message}`; }));
+loadRawConfig().catch(error => { document.querySelector('#validate-status').textContent = `Load failed: ${error.message}`; });
 refresh().catch(error => { document.querySelector('#updated').textContent = error.message; });
 setInterval(() => refresh().catch(() => {}), 5000);
 </script>

@@ -517,29 +517,37 @@ fn editor_origin_matches_host(origin: &HeaderValue, host: &HeaderValue) -> bool 
     if origin_str == "null" || host_str.is_empty() {
         return false;
     }
-    // Origin syntax: scheme "://" host [ ":" port ] with no trailing path.
-    let (scheme, rest) = match origin_str.split_once("://") {
-        Some(pair) => pair,
-        None => return false,
+    let origin_url = match Url::parse(origin_str) {
+        Ok(url) => url,
+        Err(_) => return false,
     };
-    if scheme != "http" && scheme != "https" {
+    // Scheme is syntax-checked, but authority is compared to Host because the
+    // gateway may sit behind an HTTPS-terminating Tailscale/reverse proxy.
+    if !matches!(origin_url.scheme(), "http" | "https")
+        || origin_url.username() != ""
+        || origin_url.password().is_some()
+        || origin_url.path() != "/"
+        || origin_url.query().is_some()
+        || origin_url.fragment().is_some()
+    {
         return false;
     }
-    if rest.contains('/') || rest.contains('?') || rest.contains('#') {
-        return false;
-    }
-    // Strip default ports so http://example.com:80 matches Host: example.com
-    let origin_authority = match (scheme, rest.split_once(':')) {
-        ("http", Some((h, "80"))) => h,
-        ("https", Some((h, "443"))) => h,
-        _ => rest,
+    let host_authority = match host_str.parse::<axum::http::uri::Authority>() {
+        Ok(authority) if authority.as_str().find('@').is_none() => authority,
+        _ => return false,
     };
-    let host_authority = match host_str.split_once(':') {
-        Some((h, "80")) => h,
-        Some((h, "443")) => h,
-        _ => host_str,
-    };
-    origin_authority.eq_ignore_ascii_case(host_authority)
+    let origin_port = origin_url.port_or_known_default();
+    let host_port = host_authority.port_u16();
+    origin_url
+        .host_str()
+        .is_some_and(|origin_host| origin_host.eq_ignore_ascii_case(host_authority.host()))
+        && match (origin_port, host_port) {
+            (Some(origin_port), Some(host_port)) => origin_port == host_port,
+            (None, Some(_)) => false,
+            // The request scheme is not reliable behind a TLS terminator;
+            // an omitted Host port is therefore accepted for matching hosts.
+            (_, None) => true,
+        }
 }
 
 async fn require_same_origin(req: Request<Body>, next: Next) -> Response {
@@ -604,11 +612,11 @@ async fn handle_get_config(
                 .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
             response
         },
-        Err(e) => {
-            error!(path = %reloader.config_path.display(), error = %e, "Failed to read raw config file");
+        Err(error) => {
+            error!(error = %error, "Failed to read raw config file");
             let body = serde_json::json!({
                 "error": {
-                    "message": format!("Failed to read config file: {}", e),
+                    "message": "Failed to read config file",
                     "type": "internal_error",
                     "code": 500
                 }
@@ -657,13 +665,21 @@ fn validate_config_candidate(
     let config: Config = match toml::from_str(&expanded) {
         Ok(c) => c,
         Err(e) => {
+            // Spans point into the expanded text; when ${VAR} placeholders
+            // changed the offsets the reported location is approximate.
+            let approximates = expanded != raw_content;
+            let note = if approximates {
+                " (location is approximate because ${VAR} placeholders were expanded)"
+            } else {
+                ""
+            };
             let (line, col) = e.span().map_or((None, None), |span| {
                 let prefix = &expanded[..span.start.min(expanded.len())];
                 let line = prefix.lines().count().max(1);
                 let col = prefix.lines().last().map_or(1, |l| l.len() + 1);
                 (Some(line), Some(col))
             });
-            return Err((e.to_string(), line, col));
+            return Err((format!("{e}{note}"), line, col));
         },
     };
     if let Err(e) = config.validate() {
@@ -678,6 +694,7 @@ fn validate_config_candidate(
 /// POST /validate — dry-run validator, performs zero writes.
 async fn handle_post_validate(
     axum::extract::State(reloader): axum::extract::State<Reloader>,
+    axum::Extension(request_id): axum::Extension<String>,
     axum::Json(payload): axum::Json<ValidateRequest>,
 ) -> (StatusCode, axum::Json<ValidateResponse>) {
     match validate_config_candidate(&payload.config, reloader.metrics.clone()) {
@@ -688,13 +705,16 @@ async fn handle_post_validate(
                 errors: vec![],
             }),
         ),
-        Err((message, line, col)) => (
-            StatusCode::BAD_REQUEST,
-            axum::Json(ValidateResponse {
-                valid: false,
-                errors: vec![ValidationErrorItem { message, line, col }],
-            }),
-        ),
+        Err((message, line, col)) => {
+            warn!(request_id = %request_id, "Config dry-run validation failed");
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(ValidateResponse {
+                    valid: false,
+                    errors: vec![ValidationErrorItem { message, line, col }],
+                }),
+            )
+        },
     }
 }
 
@@ -2408,6 +2428,11 @@ mod integration_tests {
         assert!(html.contains("data.virtual_models"));
         assert!(html.contains("target.weight"));
         assert!(html.contains("Recent requests"));
+        assert!(html.contains("Configuration editor"));
+        assert!(html.contains("/config"));
+        assert!(html.contains("/validate"));
+        assert!(html.contains("textContent"));
+        assert!(html.contains("JSON.stringify({ config: editor.value })"));
     }
 
     // -----------------------------------------------------------------------
@@ -3084,6 +3109,23 @@ models = ["model"]
         request
     }
 
+    async fn validate_via_router(raw: String) -> (StatusCode, serde_json::Value) {
+        let router = editor_router(std::path::PathBuf::from("unused-config.toml")).await;
+        let payload = serde_json::json!({ "config": raw })
+            .to_string()
+            .into_bytes();
+        let response = router
+            .oneshot(editor_request("POST", "/validate", Some(payload)))
+            .await
+            .expect("router answers validation");
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        (status, value)
+    }
+
     async fn editor_router(config_path: std::path::PathBuf) -> axum::Router {
         let (_ws, wr) = tokio::sync::watch::channel(Arc::new(AppState {
             providers: vec![],
@@ -3173,6 +3215,90 @@ models = ["model"]
             RAW_CONFIG.as_bytes()
         );
         assert_eq!(std::fs::read(&backup).expect("bak intact"), b"old");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn parse_diagnostics_label_approximate_location_after_expansion() {
+        let raw = "[server]\nhost = \"127.0.0.1\"\nport = 8080\notel_endpoint = \"http://127.0.0.1:4318\"\n\n[[providers]]\nname = \"p\"\nenabled = true\nbase_url = \"${OXLLM_EDITOR_TEST_BASE}\"\napi_key = \"k\"\nmodels = [\"m\"]\nport_typo = 1\n";
+        std::env::set_var("OXLLM_EDITOR_TEST_BASE", "https://example.com");
+        let (_status, value) = validate_via_router(raw.to_string()).await;
+        let message = value["errors"][0]["message"]
+            .as_str()
+            .expect("message")
+            .to_string();
+        assert!(message.contains("port_typo"), "{message}");
+        assert!(
+            message.contains("approximate"),
+            "expanded spans must be labeled: {message}"
+        );
+        assert_eq!(value["errors"][0]["line"], serde_json::json!(11));
+        std::env::remove_var("OXLLM_EDITOR_TEST_BASE");
+    }
+
+    #[tokio::test]
+    async fn validate_matrix_is_dry_run_for_all_candidate_failures() {
+        let dir = std::env::temp_dir().join(format!("oxllm-editor-matrix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+        let backup = dir.join("config.toml.bak");
+        std::fs::write(&backup, b"exact backup bytes").expect("test backup");
+        let router = editor_router(config_path.clone()).await;
+        let base = RAW_CONFIG;
+        let cases = [
+            ("syntax", "not = [valid".to_string(), "TOML"),
+            (
+                "missing environment variable",
+                base.replace("sk-editor-secret", "${OXLLM_EDITOR_MISSING_TEST_VAR}").to_string(),
+                "OXLLM_EDITOR_MISSING_TEST_VAR",
+            ),
+            (
+                "dangling provider reference",
+                base.replace("name = \"prov\"", "name = \"elsewhere\"")
+                    .to_string() + "\n[virtual_models]\nvm = [{ provider = \"prov\", model = \"model\" }]\n",
+                "prov",
+            ),
+            (
+                "zero target weight",
+                base.to_string() + "\n[virtual_models]\nvm = [{ provider = \"prov\", model = \"model\", weight = 0 }]\n",
+                "positive weight",
+            ),
+            (
+                "malformed enabled base URL",
+                base.replace("http://127.0.0.1:1", "file:///etc/passwd").to_string(),
+                "http or https",
+            ),
+        ];
+        for (label, raw, expected) in cases {
+            let payload = serde_json::json!({ "config": raw })
+                .to_string()
+                .into_bytes();
+            let response = router
+                .clone()
+                .oneshot(editor_request("POST", "/validate", Some(payload)))
+                .await
+                .expect("router answers validation");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{label}");
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+            let message = value["errors"][0]["message"]
+                .as_str()
+                .expect("error message");
+            assert!(message.contains(expected), "{label}: {message}");
+            assert_eq!(
+                std::fs::read(&config_path).expect("config intact"),
+                RAW_CONFIG.as_bytes(),
+                "{label}"
+            );
+            assert_eq!(
+                std::fs::read(&backup).expect("backup intact"),
+                b"exact backup bytes",
+                "{label}"
+            );
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
