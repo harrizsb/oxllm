@@ -1,6 +1,6 @@
 story_id: e01s03
 title: 'Apply: one-generation backup, atomic swap, in-process reload'
-status: todo
+status: done
 bcps: 6
 tasks:
 - id: 1
@@ -9,7 +9,7 @@ tasks:
     state publication
   verify: cargo test -p oxllm reload_serial
   risk: P0
-  status: failing
+  status: passing
   security: high
   allure:
     severity: critical
@@ -23,7 +23,7 @@ tasks:
     URL or candidate-state failure returns 400 and leaves config and .bak untouched'
   verify: cargo test -p oxllm apply_invalid_no_write
   risk: P0
-  status: failing
+  status: passing
   security: high
   allure:
     severity: critical
@@ -36,7 +36,7 @@ tasks:
     surfaced distinctly'
   verify: cargo test -p oxllm apply_atomic
   risk: P0
-  status: failing
+  status: passing
   security: high
   allure:
     severity: critical
@@ -49,7 +49,7 @@ tasks:
     and .bak exactness after injected filesystem failures
   verify: cargo test -p oxllm apply_reload_continuity
   risk: P0
-  status: failing
+  status: passing
   security: high
   allure:
     severity: critical
@@ -62,7 +62,7 @@ tasks:
     rendering
   verify: cargo test -p oxllm apply_origin && grep -q apply-config crates/oxllm/src/dashboard.html
   risk: P0
-  status: failing
+  status: passing
   security: high
   allure:
     severity: critical
@@ -74,7 +74,7 @@ tasks:
   verify: grep -q "Amendment A1" docs/handoff-completion.md && grep -q "Unreleased"
     CHANGELOG.md
   risk: P2
-  status: failing
+  status: passing
   security: low
   allure:
     severity: normal
@@ -87,7 +87,7 @@ tasks:
     && cargo test --workspace && cargo build --release && [ "$(stat -c %s target/release/oxllm)"
     -lt 15728640 ]
   risk: P0
-  status: failing
+  status: passing
   security: high
   allure:
     severity: critical

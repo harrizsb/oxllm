@@ -144,28 +144,37 @@ async function validateConfig() {
 }
 async function applyConfig() {
   const editor = document.querySelector('#config-editor');
+  const button = document.querySelector('#apply-config');
   const status = document.querySelector('#validate-status');
   const errors = document.querySelector('#validate-errors');
-  errors.replaceChildren();
-  status.textContent = 'Applying configuration…';
-  const response = await fetch('/apply', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ config: editor.value }),
-  });
-  const result = await response.json();
-  if (!response.ok || !result.applied) {
-    status.textContent = 'Apply failed. The active configuration was not changed; see diagnostics.';
-    const entry = document.createElement('li');
-    entry.textContent = result.error?.message || `Request failed (${response.status})`;
-    errors.append(entry);
+  if (!window.confirm('Apply this configuration? The current config.toml will be backed up to config.toml.bak.')) {
     return;
   }
-  const restartFields = result.restart_required || [];
-  status.textContent = restartFields.length
-    ? `Applied providers and saved config. Restart required for: ${restartFields.join(', ')}.`
-    : 'Applied and reloaded successfully. A one-generation config.toml.bak was saved.';
-  await refresh();
+  errors.replaceChildren();
+  button.disabled = true;
+  status.textContent = 'Applying configuration…';
+  try {
+    const response = await fetch('/apply', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: editor.value }),
+    });
+    const result = await response.json();
+    if (!response.ok || !result.applied) {
+      status.textContent = 'Apply failed. The active configuration was not changed; see diagnostics.';
+      const entry = document.createElement('li');
+      entry.textContent = result.error?.message || `Request failed (${response.status})`;
+      errors.append(entry);
+      return;
+    }
+    const restartFields = result.restart_required || [];
+    status.textContent = restartFields.length
+      ? `Applied providers and saved config. Restart required for: ${restartFields.join(', ')}.`
+      : 'Applied and reloaded successfully. A one-generation config.toml.bak was saved.';
+    await refresh();
+  } finally {
+    button.disabled = false;
+  }
 }
 document.querySelector('#apply-config').addEventListener('click', () => applyConfig().catch(error => { document.querySelector('#validate-status').textContent = `Apply failed: ${error.message}`; }));
 document.querySelector('#load-config').addEventListener('click', () => loadRawConfig().catch(error => { document.querySelector('#validate-status').textContent = `Load failed: ${error.message}`; }));

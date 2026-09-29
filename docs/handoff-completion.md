@@ -82,3 +82,10 @@ cargo test --workspace && cargo fmt --check && cargo clippy --workspace --all-ta
 ./target/release/oxllm validate --config config.toml
 ./target/release/oxllm serve --config config.toml &   # then GET /dashboard and /status
 ```
+
+## Amendment A1 (rev 2): Tailscale Gateway & Live Configuration Editor
+
+Implemented under epic `e01` (`feat/tailscale-gateway-editor`):
+1. **Tailscale & Loopback Security Boundary (`e01s01`)**: Gateway only accepts requests originating from loopback (`127.0.0.0/8`, `::1`) or the Tailscale IPv4 CGNAT range (`100.64.0.0/10`). All unauthorized requests receive a structured JSON 403 error retaining the request ID. IPv4 host binding is validated strictly; wildcard `0.0.0.0` and IPv6 are rejected. Coordinated dual listeners bind the configured IPv4 and `127.0.0.1`.
+2. **Raw Config Inspection & Dry-Run Validation (`e01s02`)**: `GET /config` serves verbatim bytes of `config.toml` (`Cache-Control: no-store`) without expanding environment placeholders `${VAR}`. `POST /validate` dry-runs parsing, expansion, strict configuration validation, and `build_app_state` in memory without writing to disk. Editor routes enforce same-origin verification while allowing non-browser tools lacking `Origin`.
+3. **Transactional Apply Pipeline & Dashboard Integration (`e01s03`)**: `POST /apply` coordinates with SIGHUP and HTTP reload using a shared async lock. It validates and prebuilds the new `AppState` before staging file writes. A one-generation backup (`config.toml.bak`) is staged and synced before the new configuration replaces `config.toml`. Failures before commit or during state publication restore original bytes atomically and sync the parent directory. Persisted changes to `host`, `port`, or `otel_endpoint` are marked with `restart_required`.

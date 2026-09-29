@@ -515,7 +515,10 @@ async fn stage_synced_file(
     permissions: Option<std::fs::Permissions>,
 ) -> Result<PathBuf, String> {
     let temp = sibling_temp_path(destination, "tmp");
-    io.write_tmp_and_sync(&temp, bytes, permissions).await?;
+    if let Err(error) = io.write_tmp_and_sync(&temp, bytes, permissions).await {
+        let _ = tokio::fs::remove_file(&temp).await;
+        return Err(error);
+    }
     Ok(temp)
 }
 
@@ -526,7 +529,7 @@ async fn atomic_restore(io: &ReloadIo, destination: &Path, bytes: &[u8]) -> Resu
         .map(|m| m.permissions());
     let temp = stage_synced_file(io, destination, bytes, permissions).await?;
     match io.rename(&temp, destination).await {
-        Ok(()) => Ok(()),
+        Ok(()) => sync_parent_directory(destination).await,
         Err(error) => {
             let _ = tokio::fs::remove_file(&temp).await;
             Err(error)
@@ -544,6 +547,14 @@ async fn sync_parent_directory(path: &Path) -> Result<(), String> {
     })
     .await
     .map_err(|error| format!("directory sync task failed: {error}"))?
+}
+
+async fn remove_file_synced(path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => sync_parent_directory(path).await,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("failed to remove {}: {error}", path.display())),
+    }
 }
 
 async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'static str>, String> {
@@ -580,10 +591,24 @@ async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'stati
         &reloader.io,
         &reloader.config_path,
         candidate.raw.as_bytes(),
-        Some(permissions),
+        Some(permissions.clone()),
     )
     .await?;
-    let backup_temp = stage_synced_file(&reloader.io, &old_backup_path, &old_raw, None).await?;
+    // The backup holds the same secrets as the config; never widen its mode.
+    let backup_temp = match stage_synced_file(
+        &reloader.io,
+        &old_backup_path,
+        &old_raw,
+        Some(permissions),
+    )
+    .await
+    {
+        Ok(path) => path,
+        Err(error) => {
+            let _ = tokio::fs::remove_file(&config_temp).await;
+            return Err(error);
+        },
+    };
 
     // Install the new one-generation backup first. Until the config rename
     // commits, failures restore the previous backup exactly.
@@ -593,6 +618,7 @@ async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'stati
         return Err(format!("failed to replace backup: {error}"));
     }
     let commit_result = async {
+        sync_parent_directory(&old_backup_path).await?;
         reloader
             .io
             .rename(&config_temp, &reloader.config_path)
@@ -605,15 +631,19 @@ async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'stati
         let config_restore = atomic_restore(&reloader.io, &reloader.config_path, &old_raw).await;
         let backup_restore = match old_backup {
             Some(bytes) => atomic_restore(&reloader.io, &old_backup_path, &bytes).await,
-            None => tokio::fs::remove_file(&old_backup_path)
-                .await
-                .map_err(|e| format!("failed to remove new backup: {e}")),
+            None => remove_file_synced(&old_backup_path).await,
         };
         return match (config_restore, backup_restore) {
-            (Ok(()), Ok(())) => Err(format!("failed to commit config: {error}; previous files restored")),
-            (config_result, backup_result) => Err(format!(
-                "failed to commit config: {error}; ROLLBACK FAILED: config={config_result:?}, backup={backup_result:?}"
+            (Ok(()), Ok(())) => Err(format!(
+                "failed to commit config: {error}; previous files restored"
             )),
+            (config_result, backup_result) => {
+                let message = format!(
+                    "failed to commit config: {error}; ROLLBACK FAILED: config={config_result:?}, backup={backup_result:?}"
+                );
+                error!("{}", message);
+                Err(message)
+            },
         };
     }
 
@@ -621,15 +651,19 @@ async fn apply_candidate(reloader: &Reloader, raw: String) -> Result<Vec<&'stati
         let config_restore = atomic_restore(&reloader.io, &reloader.config_path, &old_raw).await;
         let backup_restore = match old_backup {
             Some(bytes) => atomic_restore(&reloader.io, &old_backup_path, &bytes).await,
-            None => tokio::fs::remove_file(&old_backup_path)
-                .await
-                .map_err(|e| format!("failed to remove new backup: {e}")),
+            None => remove_file_synced(&old_backup_path).await,
         };
         return match (config_restore, backup_restore) {
-            (Ok(()), Ok(())) => Err("state publication failed; previous config and backup restored".into()),
-            (config_result, backup_result) => Err(format!(
-                "state publication failed; rollback errors: config={config_result:?}, backup={backup_result:?}"
-            )),
+            (Ok(()), Ok(())) => {
+                Err("state publication failed; previous config and backup restored".into())
+            },
+            (config_result, backup_result) => {
+                let message = format!(
+                    "state publication failed; ROLLBACK FAILED: config={config_result:?}, backup={backup_result:?}"
+                );
+                error!("{}", message);
+                Err(message)
+            },
         };
     }
     Ok(restart_required)
@@ -3751,7 +3785,7 @@ mod apply_tests {
     use super::*;
 
     #[test]
-    fn reloader_reload_lock_serializes_across_clones() {
+    fn reload_serial_lock_serializes_across_clones() {
         // Task 1: Verify the reload/apply lock exists on Reloader and serializes
         // across clones of Reloader, preventing concurrent HTTP reload,
         // SIGHUP, and Apply operations.
@@ -3880,7 +3914,7 @@ vm2 = [{ provider = "prov2", model = "m2" }]
     }
 
     #[tokio::test]
-    async fn apply_success_swaps_config_writes_exact_backup_and_preserves_metrics() {
+    async fn apply_reload_continuity_swaps_config_writes_exact_backup_preserves_metrics() {
         let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
         // Record initial metric state to verify continuity
         // prompt=10, cached=4, completion=6 -> total_tokens = 16
@@ -3982,7 +4016,7 @@ vm3 = [{ provider = "prov3", model = "m3" }]
     }
 
     #[tokio::test]
-    async fn apply_invalid_config_writes_nothing_and_preserves_old_state() {
+    async fn apply_invalid_no_write_and_preserves_old_state() {
         let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
         let backup_path = reloader.config_path.with_extension("toml.bak");
 
@@ -4054,7 +4088,7 @@ vm3 = [{ provider = "prov3", model = "m3" }]
     }
 
     #[tokio::test]
-    async fn injected_temp_sync_failure_leaves_config_and_bak_untouched() {
+    async fn apply_atomic_sync_failure_leaves_config_and_bak_untouched() {
         let failing_io = ReloadIo {
             fail_sync: Some("simulated sync write failure".into()),
             fail_rename: None,
@@ -4088,7 +4122,7 @@ vm3 = [{ provider = "prov3", model = "m3" }]
     }
 
     #[tokio::test]
-    async fn injected_rename_failure_restores_previous_backup_and_aborts() {
+    async fn apply_atomic_rename_failure_restores_previous_backup() {
         let (dir, reloader, _router) = setup_apply_fixture(ReloadIo::default());
         let backup_path = reloader.config_path.with_extension("toml.bak");
         std::fs::write(&backup_path, b"pre-existing-backup-exact-bytes").unwrap();
@@ -4143,7 +4177,7 @@ vm3 = [{ provider = "prov3", model = "m3" }]
     }
 
     #[tokio::test]
-    async fn cross_origin_apply_is_rejected_before_any_write() {
+    async fn apply_origin_cross_origin_rejected_before_write() {
         let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
         let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
             .to_string()
@@ -4172,7 +4206,7 @@ vm3 = [{ provider = "prov3", model = "m3" }]
         let _ = dir;
     }
     #[tokio::test]
-    async fn publish_failure_triggers_atomic_rollback_and_preserves_old_state() {
+    async fn apply_reload_continuity_publish_failure_rolls_back_atomically() {
         let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
         drop(router);
         // A sender with no live receivers forces publication to fail.
@@ -4215,6 +4249,161 @@ vm3 = [{ provider = "prov3", model = "m3" }]
         // Pre-existing backup was absent; no lingering .bak left after rollback
         let backup_path = reloader.config_path.with_extension("toml.bak");
         assert!(!backup_path.exists());
+        let _ = dir;
+    }
+    #[tokio::test]
+    async fn reload_serial_concurrent_applies_cannot_interleave() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let config_a = UPDATED_APPLY_CONFIG.to_string();
+        let config_b = BASE_APPLY_CONFIG.replace("prov1", "provB");
+
+        let make_request = |body: Vec<u8>| {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/apply")
+                .header(header::HOST, "127.0.0.1:8080")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+            request
+        };
+
+        let router_a = router.clone();
+        let router_b = router.clone();
+        let a = tokio::spawn(async move {
+            let body = serde_json::json!({ "config": config_a })
+                .to_string()
+                .into_bytes();
+            router_a.oneshot(make_request(body)).await.expect("apply A")
+        });
+        let b = tokio::spawn(async move {
+            let body = serde_json::json!({ "config": config_b })
+                .to_string()
+                .into_bytes();
+            router_b.oneshot(make_request(body)).await.expect("apply B")
+        });
+        let (response_a, response_b) = (a.await.expect("join A"), b.await.expect("join B"));
+        assert_eq!(response_a.status(), StatusCode::OK);
+        assert_eq!(response_b.status(), StatusCode::OK);
+
+        // Whatever the interleaving, the on-disk config must be exactly one
+        // candidate and the backup must hold the other (or the original).
+        let final_config = std::fs::read_to_string(&reloader.config_path).unwrap();
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let backup = std::fs::read_to_string(&backup_path).unwrap();
+        let candidate_a = UPDATED_APPLY_CONFIG;
+        let candidate_b = BASE_APPLY_CONFIG.replace("prov1", "provB");
+        let a_final = final_config == candidate_a;
+        let b_final = final_config == candidate_b;
+        assert!(
+            a_final || b_final,
+            "final config must equal one full candidate, got: {final_config}"
+        );
+        if a_final {
+            assert!(
+                backup == candidate_b || backup == BASE_APPLY_CONFIG,
+                "backup must hold a complete prior generation"
+            );
+        } else {
+            assert!(
+                backup == candidate_a || backup == BASE_APPLY_CONFIG,
+                "backup must hold a complete prior generation"
+            );
+        }
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_backup_permissions_are_no_broader_than_config() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        std::fs::set_permissions(
+            &reloader.config_path,
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        let payload = serde_json::json!({ "config": UPDATED_APPLY_CONFIG })
+            .to_string()
+            .into_bytes();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(payload))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let backup = reloader.config_path.with_extension("toml.bak");
+        let mode = std::fs::metadata(backup).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_atomic_backup_rename_failure_preserves_config_and_existing_backup() {
+        let (dir, reloader, _router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let old_backup = b"old backup bytes exact";
+        std::fs::write(&backup_path, old_backup).unwrap();
+        let failing_reloader = Reloader {
+            io: ReloadIo {
+                fail_sync: None,
+                fail_rename: None,
+                fail_rename_on_call: Some(1),
+                rename_calls: Arc::new(AtomicU64::new(0)),
+            },
+            ..reloader.clone()
+        };
+        let result = apply_candidate(&failing_reloader, UPDATED_APPLY_CONFIG.to_string()).await;
+        assert!(result.is_err());
+        assert_eq!(
+            std::fs::read(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG.as_bytes()
+        );
+        assert_eq!(std::fs::read(&backup_path).unwrap(), old_backup);
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_reload_continuity_publish_rollback_failure_is_reported() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        drop(router);
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let old_backup = b"existing backup exact bytes";
+        std::fs::write(&backup_path, old_backup).unwrap();
+        let (sender, receiver) =
+            tokio::sync::watch::channel(reloader.sender.subscribe().borrow().clone());
+        drop(receiver);
+        let failing_reloader = Reloader {
+            sender,
+            io: ReloadIo {
+                fail_sync: None,
+                fail_rename: None,
+                fail_rename_on_call: Some(3),
+                rename_calls: Arc::new(AtomicU64::new(0)),
+            },
+            ..reloader.clone()
+        };
+        let result = apply_candidate(&failing_reloader, UPDATED_APPLY_CONFIG.to_string()).await;
+        let error = result.expect_err("publication and rollback should fail");
+        assert!(
+            error.contains("ROLLBACK FAILED"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            error.contains("config=Err"),
+            "config restore failure missing: {error}"
+        );
+        // Backup restoration still succeeds; current config remains the new generation because
+        // the injected failure blocked its atomic restore rename, which is reported explicitly.
+        assert_eq!(std::fs::read(&backup_path).unwrap(), old_backup);
         let _ = dir;
     }
 }
