@@ -1011,6 +1011,41 @@ mod integration_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    #[test]
+    fn tailnet_only_allows_only_loopback_and_ipv4_cgnat() {
+        let allowed = [
+            "127.0.0.1",
+            "::1",
+            "::ffff:127.0.0.1",
+            "100.64.0.1",
+            "100.127.255.254",
+            "::ffff:100.64.0.1",
+        ];
+        for address in allowed {
+            let ip = address.parse().expect("test IP literal must parse");
+            assert!(
+                is_tailnet_or_loopback(ip),
+                "expected {address} to be allowed"
+            );
+        }
+
+        let rejected = [
+            "8.8.8.8",
+            "192.168.1.10",
+            "100.0.0.1",
+            "100.128.0.0",
+            "2001:db8::1",
+            "fd7a:115c:a1e0::1",
+        ];
+        for address in rejected {
+            let ip = address.parse().expect("test IP literal must parse");
+            assert!(
+                !is_tailnet_or_loopback(ip),
+                "expected {address} to be rejected"
+            );
+        }
+    }
+
     async fn spawn_mock_upstream(responses: Vec<String>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
