@@ -2840,3 +2840,252 @@ mod integration_tests {
         assert_eq!(id_str.len(), 22);
     }
 }
+
+#[cfg(test)]
+mod editor_tests {
+    //! e01s02: raw config view + dry-run Validate endpoint behavior.
+    use super::*;
+    use axum::body::Body;
+    use tower::util::ServiceExt;
+
+    /// Raw TOML used by editor endpoint tests; deliberately contains a literal
+    /// secret and a ${VAR} placeholder that must survive byte-for-byte.
+    const RAW_CONFIG: &str = r#"[server]
+host = "127.0.0.1"
+port = 0
+otel_endpoint = "http://127.0.0.1:4318"
+
+[[providers]]
+name = "prov"
+enabled = true
+base_url = "http://127.0.0.1:1"
+api_key = "sk-editor-secret"
+models = ["model"]
+"#;
+
+    fn editor_request(method: &str, uri: &str, body: Option<Vec<u8>>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "127.0.0.1:8080");
+        if let Some(bytes) = body {
+            builder = builder.header(header::CONTENT_TYPE, "application/json");
+            return builder
+                .body(Body::from(bytes))
+                .expect("static test request must build");
+        }
+        builder
+            .body(Body::empty())
+            .expect("static test request must build")
+    }
+
+    async fn editor_router(config_path: std::path::PathBuf) -> axum::Router {
+        let (_ws, wr) = tokio::sync::watch::channel(Arc::new(AppState {
+            providers: vec![],
+            virtual_models: std::collections::HashMap::new(),
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::new(),
+            upstream_timeout_secs: 5,
+        }));
+        let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(8);
+        let reloadable_state = ReloadableState {
+            app_state: wr,
+            telemetry: TelemetryClient::new(telemetry_tx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: _ws,
+                config_path,
+                metrics: Arc::new(RuntimeMetrics::default()),
+            },
+        };
+        build_router(reloadable_state)
+    }
+
+    #[tokio::test]
+    async fn config_raw_serves_exact_bytes_without_expansion() {
+        let dir = std::env::temp_dir().join(format!("oxllm-editor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+
+        let router = editor_router(config_path.clone()).await;
+        let response = router
+            .oneshot(editor_request("GET", "/config", None))
+            .await
+            .expect("router answers /config");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .map(|v| v.to_str().unwrap_or_default()),
+            Some("no-store")
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body readable");
+        assert_eq!(
+            std::str::from_utf8(&bytes).expect("utf-8"),
+            RAW_CONFIG,
+            "raw config bytes must round-trip exactly, including secrets and placeholders"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn validate_reports_diagnostics_without_touching_disk() {
+        let dir =
+            std::env::temp_dir().join(format!("oxllm-editor-validate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+        let backup = dir.join("config.toml.bak");
+        std::fs::write(&backup, b"old").expect("test bak");
+
+        let router = editor_router(config_path.clone()).await;
+        let payload = br#"{"config":"[server]\nhost = \"127.0.0.1\"\nport = 8080\notel_endpoint = \"http://127.0.0.1:4318\"\nport_typo = 1\n"}"#.to_vec();
+        let response = router
+            .oneshot(editor_request("POST", "/validate", Some(payload)))
+            .await
+            .expect("router answers /validate");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["valid"], serde_json::json!(false));
+        let message = value["errors"][0]["message"]
+            .as_str()
+            .expect("message present")
+            .to_string();
+        assert!(
+            message.contains("port_typo"),
+            "diagnostic must name the field: {message}"
+        );
+        assert_eq!(
+            std::fs::read(&config_path).expect("config intact"),
+            RAW_CONFIG.as_bytes()
+        );
+        assert_eq!(std::fs::read(&backup).expect("bak intact"), b"old");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn validate_accepts_valid_config_with_200() {
+        let dir = std::env::temp_dir().join(format!("oxllm-editor-valid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test dir");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, RAW_CONFIG).expect("test config");
+
+        let router = editor_router(config_path).await;
+        let payload = br#"{"config":"[server]\nhost = \"100.115.92.2\"\nport = 8080\notel_endpoint = \"http://127.0.0.1:4318\"\n\n[[providers]]\nname = \"p\"\nenabled = true\nbase_url = \"https://example.com\"\napi_key = \"k\"\nmodels = [\"m\"]\n"}"#.to_vec();
+        let response = router
+            .oneshot(editor_request("POST", "/validate", Some(payload)))
+            .await
+            .expect("router answers /validate");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["valid"], serde_json::json!(true));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn editor_endpoints_reject_cross_origin_requests() {
+        let router = editor_router(std::path::PathBuf::from("unused-config.toml")).await;
+
+        // Cross-origin GET /config must be refused.
+        let mut request = editor_request("GET", "/config", None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Same-origin GET /config is allowed.
+        let mut request = editor_request("GET", "/config", None);
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_ne!(response.status(), StatusCode::FORBIDDEN);
+
+        // Cross-origin POST /validate must be refused before validation runs.
+        let mut request = editor_request(
+            "POST",
+            "/validate",
+            Some(br#"{"config":"[server]"}"#.to_vec()),
+        );
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Origin: null is refused.
+        let mut request = editor_request("GET", "/config", None);
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, HeaderValue::from_static("null"));
+        let response = router.clone().oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // Duplicate Origin headers are refused.
+        let mut request = editor_request("GET", "/config", None);
+        request.headers_mut().append(
+            header::ORIGIN,
+            HeaderValue::from_static("http://127.0.0.1:8080"),
+        );
+        request.headers_mut().append(
+            header::ORIGIN,
+            HeaderValue::from_static("http://evil.example"),
+        );
+        let response = router.oneshot(request).await.expect("answers");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn origin_policy_matches_same_authority_and_rejects_mismatches() {
+        // Same-origin, explicit and implicit ports.
+        assert!(editor_origin_matches_host(
+            &HeaderValue::from_static("http://127.0.0.1:8080"),
+            &HeaderValue::from_static("127.0.0.1:8080"),
+        ));
+        assert!(editor_origin_matches_host(
+            &HeaderValue::from_static("http://host.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        assert!(editor_origin_matches_host(
+            &HeaderValue::from_static("https://host.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        // Different host, port, or scheme.
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("http://evil.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("http://host.example:8080"),
+            &HeaderValue::from_static("host.example:9090"),
+        ));
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("ftp://host.example"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        // "null" and paths/queries are not same-origin.
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("null"),
+            &HeaderValue::from_static("host.example"),
+        ));
+        assert!(!editor_origin_matches_host(
+            &HeaderValue::from_static("http://host.example/path"),
+            &HeaderValue::from_static("host.example"),
+        ));
+    }
+}
