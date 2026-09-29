@@ -28,3 +28,4 @@ tower-http = { version = "0.6", features = ["cors"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
+tower = { version = "0.5", features = ["util"] }

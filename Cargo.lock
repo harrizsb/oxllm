@@ -904,6 +904,7 @@ dependencies = [
  "socket2 0.5.10",
  "tokio",
  "tokio-stream",
+ "tower",
  "tower-http",
  "tracing",
  "tracing-subscriber",

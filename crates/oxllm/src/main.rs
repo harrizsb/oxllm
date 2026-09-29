@@ -2248,6 +2248,77 @@ mod integration_tests {
         (app_state, rs)
     }
 
+    /// Configures a request as if it arrived from the given peer address.
+    fn request_from_peer(uri: &str, peer: IpAddr) -> Request<Body> {
+        let mut request = Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .expect("static test request must build");
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer, 0)));
+        request
+    }
+
+    #[tokio::test]
+    async fn router_builds_and_guards_all_routes() {
+        use tower::util::ServiceExt;
+
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_state, reloadable_state) = build_test_state(upstream);
+        let router = build_router(reloadable_state);
+
+        // Loopback peer reaches every production route without auth.
+        for uri in [
+            "/v1/models",
+            "/status",
+            "/dashboard",
+            "/health",
+            "/v1/embeddings",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request_from_peer(uri, IpAddr::from([127, 0, 0, 1])))
+                .await
+                .expect("router must answer a loopback request");
+            assert!(
+                response.status() != StatusCode::FORBIDDEN,
+                "loopback peer unexpectedly denied on {uri}"
+            );
+        }
+
+        // A public source is denied on every route, including /v1.
+        for uri in [
+            "/v1/models",
+            "/status",
+            "/dashboard",
+            "/health",
+            "/reload",
+            "/admin/providers/prov/offline",
+            "/v1/chat/completions",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(request_from_peer(uri, IpAddr::from([8, 8, 8, 8])))
+                .await
+                .expect("router must answer a forged peer request");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "public source unexpectedly reached {uri}"
+            );
+            assert!(
+                response.headers().contains_key("x-request-id"),
+                "403 on {uri} lost the x-request-id header"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "403 on {uri} is not JSON"
+            );
+        }
+    }
+
     /// Builds a test router with all middleware layers (request-id, CORS).
     fn build_test_router(state: ReloadableState) -> axum::Router {
         axum::Router::new()
