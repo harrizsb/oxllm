@@ -53,6 +53,34 @@ impl Config {
 
     /// Validates the configuration syntax and cross-references virtual models with defined providers.
     pub fn validate(&self) -> Result<()> {
+        match self.server.bind_family.as_str() {
+            "ipv4" => {},
+            legacy => {
+                return Err(OxllmError::ConfigLoad(format!(
+                    "Unsupported server.bind_family '{legacy}'; remove bind_family and set server.host to an IPv4 address"
+                )));
+            },
+        }
+        let host: std::net::IpAddr = self.server.host.parse().map_err(|_| {
+            OxllmError::ConfigLoad(format!(
+                "Invalid server.host '{}': set it to a literal IPv4 address",
+                self.server.host
+            ))
+        })?;
+        match host {
+            std::net::IpAddr::V4(ipv4) if !ipv4.is_unspecified() => {},
+            std::net::IpAddr::V4(_) => {
+                return Err(OxllmError::ConfigLoad(
+                    "Invalid server.host '0.0.0.0': wildcard binding is not permitted; set a specific IPv4 address".into(),
+                ));
+            },
+            std::net::IpAddr::V6(_) => {
+                return Err(OxllmError::ConfigLoad(format!(
+                    "Invalid server.host '{}': IPv6 listeners are not supported; set a literal IPv4 address",
+                    self.server.host
+                )));
+            },
+        }
         let provider_map: HashMap<&str, &ProviderConfig> = self
             .providers
             .iter()
