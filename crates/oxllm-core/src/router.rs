@@ -81,6 +81,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                         name: provider.name.clone(),
                         base_url: provider.base_url.clone(),
                         api_key: provider.api_key.clone(),
+                        user_agent: provider.user_agent.clone(),
                         is_probe: false,
                     });
                 },
@@ -102,6 +103,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                                 name: provider.name.clone(),
                                 base_url: provider.base_url.clone(),
                                 api_key: provider.api_key.clone(),
+                                user_agent: provider.user_agent.clone(),
                                 is_probe: true,
                             });
                         }
@@ -122,6 +124,7 @@ impl RoutingStrategy for AdaptivePriorityStrategy {
                             name: provider.name.clone(),
                             base_url: provider.base_url.clone(),
                             api_key: provider.api_key.clone(),
+                            user_agent: provider.user_agent.clone(),
                             is_probe: true,
                         });
                     }
@@ -225,6 +228,7 @@ mod tests {
             name: name.to_string(),
             base_url: Url::parse("https://api.example.com").unwrap(),
             api_key: "test_key".to_string(),
+            user_agent: None,
             models: vec!["gpt-4".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),

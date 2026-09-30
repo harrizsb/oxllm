@@ -283,6 +283,7 @@ fn build_app_state(config: Config, metrics: Arc<RuntimeMetrics>) -> Result<AppSt
             base_url: url,
             api_key: p.api_key,
             models: p.models,
+            user_agent: p.user_agent,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1658,6 +1659,7 @@ mod integration_tests {
             name: "prov1".to_string(),
             base_url: Url::parse(&format!("http://{}", addr1)).unwrap(),
             api_key: "key1".to_string(),
+            user_agent: None,
             models: vec!["gpt-4-upstream".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1675,6 +1677,7 @@ mod integration_tests {
             name: "prov2".to_string(),
             base_url: Url::parse(&format!("http://{}", addr2)).unwrap(),
             api_key: "key2".to_string(),
+            user_agent: None,
             models: vec!["gpt-4-upstream".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1787,6 +1790,7 @@ mod integration_tests {
             name: "prov1".to_string(),
             base_url: Url::parse(&format!("http://{}", addr)).unwrap(),
             api_key: "key1".to_string(),
+            user_agent: None,
             models: vec!["gpt-4-upstream".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1902,6 +1906,7 @@ mod integration_tests {
             name: "primary".into(),
             base_url: Url::parse("https://api.fail.example.com/v1/").unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1919,6 +1924,7 @@ mod integration_tests {
             name: "secondary".into(),
             base_url: Url::parse("https://api.ok.example.com/v1/").unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1973,6 +1979,7 @@ mod integration_tests {
             name: name.into(),
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2099,6 +2106,7 @@ mod integration_tests {
             name: "p1".into(),
             base_url: Url::parse(&format!("http://{}/v1/", p1_addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2116,6 +2124,7 @@ mod integration_tests {
             name: "p2".into(),
             base_url: Url::parse(&format!("http://{}/v1/", p2_addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2229,6 +2238,7 @@ mod integration_tests {
             name: "resetme".into(),
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2357,6 +2367,7 @@ mod integration_tests {
             name: "emb".into(),
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2459,6 +2470,7 @@ mod integration_tests {
             name: "prov".into(),
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["real-model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2551,6 +2563,7 @@ mod integration_tests {
             name: "target".into(),
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2656,6 +2669,7 @@ mod integration_tests {
             name: "counter".into(),
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2820,6 +2834,7 @@ mod integration_tests {
             name: "prov".into(),
             base_url: Url::parse(&format!("http://{}/v1/", upstream_addr)).unwrap(),
             api_key: "key".into(),
+            user_agent: None,
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -4474,5 +4489,159 @@ vm3 = [{ provider = "prov3", model = "m3" }]
         // the injected failure blocked its atomic restore rename, which is reported explicitly.
         assert_eq!(std::fs::read(&backup_path).unwrap(), old_backup);
         let _ = dir;
+    }
+}
+
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+    use oxllm_core::config::VirtualModelTarget;
+    use serde_json::Value;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    const PINNED_UA: &str = "pi/0.87.1 (linux; node/v24.20.0; x64)";
+
+    async fn spawn_ua_capture(captured: Arc<tokio::sync::Mutex<String>>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let body = "{\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"ok\"}}]}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let ua = raw
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("user-agent:"))
+                    .and_then(|l| l.split_once(':'))
+                    .map(|(_, v)| v.trim().to_string())
+                    .unwrap_or_default();
+                *captured.lock().await = ua;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        addr
+    }
+
+    fn provider_with_ua(addr: SocketAddr, user_agent: Option<String>) -> ProviderState {
+        ProviderState {
+            name: "pinned".into(),
+            base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
+            api_key: "key".into(),
+            user_agent,
+            models: vec!["up-model".into()],
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+        }
+    }
+
+    async fn serve(app_state: Arc<AppState>) -> SocketAddr {
+        let (watch_sender, watch_receiver) = tokio::sync::watch::channel(app_state.clone());
+        let (telemetry_tx, _telemetry_rx) = tokio::sync::mpsc::channel(16);
+        let reloadable_state = ReloadableState {
+            app_state: watch_receiver,
+            telemetry: TelemetryClient::new(telemetry_tx),
+            start_time: Instant::now(),
+            reloader: Reloader {
+                sender: watch_sender,
+                config_path: std::path::PathBuf::from("/tmp/oxllm-ua-test-config.toml"),
+                metrics: Arc::new(RuntimeMetrics::default()),
+                reload_lock: Arc::new(tokio::sync::Mutex::new(())),
+                io: ReloadIo::default(),
+            },
+        };
+        let router = build_router(reloadable_state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+        addr
+    }
+
+    async fn chat(proxy_addr: SocketAddr, model: &str) -> Value {
+        let client = reqwest::Client::new();
+        let payload = serde_json::json!({
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let res = client
+            .post(format!("http://{}/v1/chat/completions", proxy_addr))
+            .json(&payload)
+            .send()
+            .await
+            .unwrap();
+        let status = res.status();
+        let body = res.text().await.unwrap();
+        assert_eq!(status, 200, "upstream response: {body}");
+        serde_json::from_str(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn chat_forwards_provider_user_agent() {
+        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let upstream = spawn_ua_capture(captured.clone()).await;
+        let app_state = Arc::new(AppState {
+            providers: vec![provider_with_ua(upstream, Some(PINNED_UA.to_string()))],
+            virtual_models: std::collections::HashMap::from([(
+                "up-model".to_string(),
+                vec![VirtualModelTarget {
+                    provider: "pinned".to_string(),
+                    model: "up-model".to_string(),
+                    weight: 1,
+                }],
+            )]),
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+        let proxy = serve(app_state).await;
+        let _ = chat(proxy, "up-model").await;
+        assert_eq!(*captured.lock().await, PINNED_UA);
+    }
+
+    #[tokio::test]
+    async fn chat_without_user_agent_stays_unset() {
+        let captured = Arc::new(tokio::sync::Mutex::new(String::new()));
+        let upstream = spawn_ua_capture(captured.clone()).await;
+        let app_state = Arc::new(AppState {
+            providers: vec![provider_with_ua(upstream, None)],
+            virtual_models: std::collections::HashMap::from([(
+                "up-model".to_string(),
+                vec![VirtualModelTarget {
+                    provider: "pinned".to_string(),
+                    model: "up-model".to_string(),
+                    weight: 1,
+                }],
+            )]),
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+        let proxy = serve(app_state).await;
+        let _ = chat(proxy, "up-model").await;
+        assert_eq!(*captured.lock().await, "");
     }
 }
