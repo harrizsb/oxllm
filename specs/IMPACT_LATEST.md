@@ -1,41 +1,24 @@
-# Impact Assessment — e01 tailscale-gateway-editor (assess-impact, default mode)
+# Impact Assessment — provider-model-ping
 
 ## Target
-- `crates/oxllm/src/main.rs`: `run_serve` listener setup (bind_family match block), `localhost_only` middleware, route table.
-- `crates/oxllm-core/src/config.rs`: `Config`/`ServerConfig`/`ProviderConfig`/`VirtualModelTarget` structs + `validate()`.
-- `crates/oxllm/src/routes.rs` + `dashboard.html`: new handlers, editor UI.
-- Decision logged (user, this session): option 1 — `[server].host` authoritative; `bind_family` restricted to `"ipv4"`; ipv6/dual wildcard binding removed; socket2 dropped.
+`crates/oxllm/src/routes.rs` — `create_chat_completions` (hot path, ~200 lines): extract the per-provider attempt into a shared helper reused by the new `POST /admin/ping` handler.
 
-## Dependents (5)
-- `main.rs run_serve` — sole consumer of bind_family/host/port; called once from CLI dispatch.
-- `localhost_only` — layered on 7 routes (status, dashboard, health, reload, admin x3). `/v1/models|embeddings|chat/completions` currently UNGUARDED (verified — true before-state).
-- `Config` structs — main.rs (load/validate/reload paths), state.rs (`VirtualModelTarget`), routes.rs (indirect), config.rs tests.
-- `dashboard.html` — `include_str!` in `routes::dashboard`; commit 684e06b added a page-content test.
-- `Cargo.toml` — socket2 removal affects both workspace and oxllm crate manifests.
+## Dependents (4)
+- `crates/oxllm/src/main.rs` `build_router` — registers `/v1/chat/completions` (call site unchanged after refactor)
+- `crates/oxllm/src/main.rs` integration tests — `test_integration_sse_streaming`, `test_integration_circuit_breaker_failover`, `test_integration_all_providers_fail_gives_502`, `test_integration_rate_limit_failover` exercise the chat path via mock upstreams
+- `crates/oxllm/src/dashboard.html` — gains Ping buttons (additive only)
+- `crates/oxllm/src/routes.rs` `create_embeddings` — NOT modified (separate inline attempt logic; out of scope)
 
 ## Affected Stories
-- e01s01 (binding + guard) — main.rs, Cargo.toml
-- e01s02 (raw config + validate) — config.rs, routes.rs, dashboard.html
-- e01s03 (apply pipeline) — routes.rs, main.rs (reload machinery), dashboard.html
+- e02s01 (new): Ping provider×model through the main request path
+- e01s01–e01s03 (shipped): regression risk confined to the chat-completions refactor
 
 ## Test Coverage
-- `oxllm-core/src/config.rs` tests: weight defaults/zero-reject, omitted virtual_models, env expansion.
-- `oxllm-core/tests/performance.rs`: latency perf only.
-- `oxllm` crate: dashboard page-content test only. **Gap: zero tests for listener setup, guard middleware, /reload, admin routes.**
-- Gap: no test binds a real server socket today; S1 introduces the first (ephemeral-port).
+- `crates/oxllm/src/main.rs` integration tests: chat success, streaming, circuit-breaker failover, all-providers-fail 502, rate-limit failover — all via `spawn_mock_upstream`
+- Gap: no test yet for the ping endpoint or the shared-attempt extraction (added by e02s01)
 
 ## Risk: Medium
-Few callers, structs are private to the workspace, but the guard and bind changes are a security boundary and the apply path writes disk; coverage gaps on exactly the touched paths require new tests before merge (each story carries its own).
+Hot-path refactor of the primary request route, but the change is a mechanical extraction (move the loop body into a helper, call it from both sites) and the integration suite covers the chat path end-to-end. No interface change; no new dependencies.
 
 ## Recommended action
-Proceed — each story's tasks include the missing coverage as acceptance; strict gates (fmt/clippy/tests) run per story.
-
-## Unknowns / preflight gaps
-- Unknown: [tech-stack.md absent; no authoritative architecture doc available].
-- Unknown: [GLOSSARY_LATEST.yaml absent; domain glossary unavailable].
-- Unknown: [e01 test-plan artifact absent; risk mapping uses plan-work heuristics].
-- Unknown: [THREAT_MODEL.md absent; security fields derive from code review and scope, not threat-model artifact].
-- `scripts/lib/plan-consistency-check.sh`, `scripts/bp-timing.sh`, `scripts/sync-status-from-epics.sh`, and the referenced countable-story-format doc are not present in this checkout/agent docs; consistency is checked manually and format uses all 20 numbered slots from the plan-work format mandate.
-
-## Security finding added during plan review
-- `main.rs` configures permissive CORS (`allow_origin(Any)`, any headers) for all routes. A third-party webpage opened in a tailnet-connected browser could otherwise GET `/config` and read secrets because the server sees the browser’s Tailscale source IP. Plan mitigation: editor endpoints reject a present Origin unless it matches Host; non-browser requests without Origin remain allowed. This is a browser-origin check, not app authentication.
+Proceed tests-first: write the ping integration test against the extracted helper before refactoring, then refactor, then add the endpoint and dashboard. Run the full gate suite before commit.

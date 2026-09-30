@@ -31,6 +31,8 @@ th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overf
 </section>
 <h2>Virtual model routing</h2>
 <p class="muted">Configured targets, SWRR weights, provider circuit health, and aggregate provider activity.</p>
+<h3>Provider model checks</h3>
+<div id="provider-pings"><p class="muted">Loading…</p></div>
 <div id="virtual-models"><p class="muted">Loading…</p></div>
 <h2>Recent requests</h2>
 <table>
@@ -53,10 +55,65 @@ th, td { text-align: left; padding: .6rem; border-bottom: 1px solid #8886; overf
 </section>
 <script>
 const number = value => Number(value || 0).toLocaleString();
+const pingStates = new Map();
+async function pingProviderModel(provider, model) {
+  const key = `${provider}\u0000${model}`;
+  pingStates.set(key, { busy: true, text: 'Pinging…' });
+  renderProviderPings(window.latestStatus?.providers || []);
+  try {
+    const response = await fetch('/admin/ping', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ provider, model }),
+    });
+    const raw = await response.text();
+    let result = null;
+    try { result = JSON.parse(raw); } catch { /* non-JSON body (e.g. limit rejection) */ }
+    const text = response.ok
+      ? (result?.ok ? `Success in ${result.latency_ms} ms` : `Failed (${result?.status}): ${result?.error || 'No details'}`)
+      : `Request rejected (${response.status}): ${result?.error?.message || 'Invalid request'}`;
+    pingStates.set(key, { busy: false, text });
+  } catch (error) {
+    pingStates.set(key, { busy: false, text: `Ping failed: ${error.message}` });
+  }
+  renderProviderPings(window.latestStatus?.providers || []);
+}
+function renderProviderPings(providers) {
+  const container = document.querySelector('#provider-pings');
+  container.replaceChildren();
+  const table = document.createElement('table');
+  const head = table.createTHead().insertRow();
+  for (const label of ['Provider', 'Model', 'Test', 'Result']) {
+    const cell = document.createElement('th'); cell.textContent = label; head.append(cell);
+  }
+  const body = table.createTBody();
+  let count = 0;
+  for (const provider of providers) {
+    for (const model of (provider.models || '').split(', ').filter(Boolean)) {
+      count++;
+      const row = body.insertRow();
+      row.insertCell().textContent = provider.name;
+      row.insertCell().textContent = model;
+      const action = row.insertCell();
+      const button = document.createElement('button');
+      button.type = 'button'; button.textContent = 'Ping';
+      button.disabled = pingStates.get(`${provider.name}\u0000${model}`)?.busy === true;
+      button.addEventListener('click', () => pingProviderModel(provider.name, model));
+      action.append(button);
+      const result = row.insertCell();
+      result.setAttribute('role', 'status');
+      result.textContent = pingStates.get(`${provider.name}\u0000${model}`)?.text || '';
+    }
+  }
+  if (count) container.append(table);
+  else { const empty = document.createElement('p'); empty.className = 'muted'; empty.textContent = 'No provider models configured'; container.append(empty); }
+}
 async function refresh() {
   const response = await fetch('/status', { cache: 'no-store' });
   if (!response.ok) throw new Error(`Request failed: ${response.status}`);
   const data = await response.json();
+  window.latestStatus = data;
+  renderProviderPings(data.providers || []);
   document.querySelector('#cached').textContent = number(data.daily_tokens.cached_tokens);
   document.querySelector('#uncached').textContent = number(data.daily_tokens.uncached_tokens);
   document.querySelector('#total').textContent = number(data.daily_tokens.total_tokens);

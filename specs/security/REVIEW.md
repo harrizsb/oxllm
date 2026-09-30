@@ -1,9 +1,13 @@
-# Security Review — Epic e01: Tailscale Gateway & Dashboard Editor
+# Security Review — e01 Gateway Editor and e02 Provider Ping
 
 ## Scope
-- Branch: `feat/tailscale-gateway-editor`
-- Files: `crates/oxllm/src/main.rs`, `crates/oxllm/src/dashboard.html`, `crates/oxllm-core/src/config.rs`, `docs/architecture.md`, `CHANGELOG.md`
-- Threat Model: `specs/security/epics/e01/THREAT_MODEL.md`
+- e01 branch: `feat/tailscale-gateway-editor`
+- e01 files: `crates/oxllm/src/main.rs`, `crates/oxllm/src/dashboard.html`, `crates/oxllm-core/src/config.rs`, `docs/architecture.md`, `CHANGELOG.md`
+- e01 Threat Model: `specs/security/epics/e01/THREAT_MODEL.md`
+- e02 branch reviewed: `feat/provider-model-ping` (PR #6)
+- e02 files: `crates/oxllm/src/main.rs`, `crates/oxllm/src/routes.rs`, `crates/oxllm/src/dashboard.html`
+- e02 Threat Model: `specs/security/epics/e02/THREAT_MODEL.md`
+- e02 follow-up review findings: HalfOpen probe permit handling fixed; non-JSON ping rejection bodies now render as request-rejected results. `ChatAttempt::Skipped` still returns HTTP 500 with JSON status 502 and does not add a request-log entry; it can only occur on local serialization/URL-join failure and is a minor diagnostics mismatch.
 
 ## Findings Matrix
 

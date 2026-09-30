@@ -1,42 +1,27 @@
 # specs/planning-context.yaml — written by elaborate-spec; consumed by scope-work and slice-tasks
-feature_name: "tailscale-gateway-and-dashboard-config-editor"
+feature_name: "provider-model-ping"
 problem_statement: >
-  oxllm runs as the only gateway service on a small VPS, reachable exclusively over a
-  Tailscale tailnet: no edge proxy, no public gateway ports, no application-layer auth.
-  Tailscale membership is the single trust boundary. On that trusted boundary, the
-  dashboard becomes the config-editing surface: a raw full-file TOML editor with
-  validation and an explicit apply path that swaps configuration without a restart.
+  Config validation proves config.toml parses and cross-references resolve, but it cannot prove a
+  provider+model actually answers. A dead API key, a typo'd model name, or a wrong base_url all pass
+  validation and only surface when a real user request fails. The operator needs a way to verify each
+  configured provider+model on demand, from the dashboard, before trusting the config.
 constraints:
-  - "oxllm listens on exactly two addresses: the Tailscale address from [server].host and 127.0.0.1; no gateway port is exposed publicly (enforced by binding + host firewall, not application logic)"
-  - "No application-layer auth anywhere: no client key, no IP allowlist, no dashboard password, no sessions, no lockout, no TLS in oxllm (WireGuard covers the tailnet)"
-  - "Raw TOML editor shows and edits the full config.toml as written: values visible, ${VAR} placeholders preserved, [server] editable (accepted risk, SSH is recovery)"
-  - "Validate is a dry run: TOML parse, existing Config::validate cross-references, unknown-field rejection; never writes"
-  - "Apply = validate -> write one-generation config.toml.bak -> atomic replace -> in-process reload; invalid input writes nothing and returns 400 with diagnostics"
-  - "The only runtime disk writes in the whole feature are the explicit .bak and config replacement triggered by Apply"
-  - "In-memory metrics survive Apply (reload path already preserves Arc<RuntimeMetrics>)"
-  - "Preserve CLAUDE.md gates: cargo fmt --check, clippy -D warnings, release binary < 15 MB, rustls, no unwrap/expect in user-facing paths"
+  - "Dashboard-only trigger: a Ping button on each provider row and each model row inside that provider (per-provider, per-model)"
+  - "Real minimal paid completion request: max_tokens 1, tiny prompt, sent to the provider chat/completions endpoint; paid requests are acceptable"
+  - "One relay endpoint POST /admin/ping {provider, model} behind the existing tailnet guard and same-origin check (browser cannot call upstreams directly: CORS)"
+  - "The handler reuses the main chat-completions request path unchanged: no new request-building logic, no parallel implementation"
+  - "Full parity: the ping counts as a normal request; provider counters, circuit-breaker feedback, 3-entry request log, daily token accounting, and telemetry all update"
+  - "No changes to existing routing, virtual-model resolution, or /v1 endpoints"
 out_of_scope:
-  - "Client key, IP allowlist, password, sessions, login, lockout, rate limiting, TLS (all dropped by the tailscale-only decision)"
-  - "Per-device access control inside oxllm (tailnet ACLs own that)"
-  - "Multi-user / multi-tenant accounts (permanently)"
-  - "Structured CRUD forms or masking layers over the raw editor"
-  - "Streaming token accounting (existing TODO from prior work)"
-  - "Key rotation or account-rotation logic"
-  - "The deprecated oxllm-deployment directory and stack during implementation (VPS decommission + tailscale setup happen in the deploy phase)"
+  - "CLI ping, ping-all-at-once, browser-to-upstream direct calls"
+  - "Changes to existing routing or virtual-model behavior"
+  - "Auth, rate limiting, multi-tenancy (tailnet is the trust boundary)"
 key_decisions:
-  - decision: "Bind oxllm to the Tailscale address plus a loopback listener"
-    rationale: "User confirmed: tailscale for all access, loopback kept so local diagnostics and deploy smoke tests work without the tailnet"
-  - decision: "Make [server].host authoritative and bind IPv4 only; remove ipv6/dual wildcard listener modes"
-    rationale: "User chose exact configured Tailscale IPv4 address plus 127.0.0.1; IPv6 listener is not required and wildcard modes violate the address-only exposure boundary"
-  - decision: "Tailscale membership is the single trust boundary; /v1 is keyless"
-    rationale: "User chose keyless tailnet-only over key-based auth; per-device control belongs to tailnet ACLs"
-  - decision: "Dashboard is a trusted terminal: raw full-file TOML editor, no masking, no key controls"
-    rationale: "User accepted direct config editing with visible secrets as the tradeoff for simplicity"
-  - decision: "Validate and Apply are separate actions; validation is a dry run, apply writes via .bak + atomic replace + in-process reload"
-    rationale: "User confirmed TOML config validation is the minimum safety requirement; recoverability via one-generation backup"
-  - decision: "Strict unknown-field rejection in config parsing"
-    rationale: "Converts silent typos into loud validation errors during edit/apply"
-  - decision: "No client-key strength validation or generation"
-    rationale: "Dropped with the client key itself; the owner may write any value"
-  - decision: "handoff.md amendment records the supersessions; revision 2 replaces the pre-code public-bind draft"
-    rationale: "Keep implementation guidance truthful; the earlier draft was superseded before implementation"
+  - decision: "Per-provider, per-model ping scope"
+    rationale: "User chose to ping the exact provider+model selected; needed to test individual keys in the key-rotation setup (glm-a vs glm-b)"
+  - decision: "Relay endpoint, not browser-direct"
+    rationale: "Browser JS cannot reliably call upstream providers (CORS); oxllm relays the one ping request"
+  - decision: "Reuse the main request path, pinned to the clicked pair"
+    rationale: "User: just use existing functionality, let the ping route through the main function; no new request logic"
+  - decision: "Full parity with a normal request"
+    rationale: "User accepted side effects: counters, breaker feedback, request log, tokens all update; it is fine"

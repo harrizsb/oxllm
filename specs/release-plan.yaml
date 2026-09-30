@@ -17,3 +17,8 @@ bugs:
   deferred: 0
   wontfix: 0
   registry: "specs/bugs/registry.yaml (not yet created; no known open bugs)"
+  - id: e02
+    title: "Provider-model ping through the main request path"
+    wsjf: 4.0
+    capsule_dir: epics/e02-provider-model-ping
+    note: "Dashboard Ping control: one real minimal completion per provider+model via the shared chat path. Single-story epic."
