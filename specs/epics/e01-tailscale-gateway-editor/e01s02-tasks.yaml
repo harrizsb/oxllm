@@ -42,8 +42,8 @@ tasks:
     severity: high
     categories: *id001
 - id: 4
-  description: 'Add POST /validate accepting application/json {config: raw_toml};
-    reject present cross-origin Origin, allow absent Origin; run existing env expansion,
+  description: 'Add POST /validate accepting application/json {config: raw_toml}; body capped at
+    1 MiB (1048576 bytes), larger rejected 413 before handler; reject present cross-origin Origin, allow absent Origin; run existing env expansion,
     strict TOML parse, Config::validate and build_app_state so dry-run predicts apply;
     return structured diagnostics incl parser span where supported; never write'
   verify: cargo test -p oxllm validate_config
