@@ -1,66 +1,54 @@
 # specs/product/SCOPE_LATEST.yaml — bounded PRD written by scope-work (spine step 1 of 3)
-feature_name: "tailscale-gateway-and-dashboard-config-editor"
+feature_name: "provider-model-ping"
 core_value: >
-  oxllm becomes the whole gateway surface of a small VPS reachable only over a Tailscale
-  tailnet, and the tailnet-only dashboard becomes the place where the operator edits,
-  validates, and applies the full TOML config without SSH or a process restart.
+  The operator can verify, on demand from the dashboard, that each configured
+  provider+model actually answers a real request — closing the gap between
+  "config parses" and "config works".
 summary: >
-  This initiative has two halves. Network half: oxllm stops being loopback-only — it
-  listens on the VPS's Tailscale address and on 127.0.0.1, nothing else. Tailscale
-  membership is the only trust boundary; there is no client key, allowlist, password,
-  session, lockout, or TLS inside oxllm. Editor half: the dashboard gains a raw,
-  full-file TOML editor (values visible, ${VAR} placeholders preserved) with two
-  actions: Validate (dry run) and Apply (validate -> one-generation config.toml.bak ->
-  atomic replace -> in-process reload). Metrics survive Apply; invalid input writes
-  nothing. The existing read-only dashboard views remain unchanged.
+  Config validation proves config.toml parses and cross-references resolve; it says
+  nothing about whether a provider+model actually answers. A dead API key, a typo'd
+  model name, or a wrong base_url all pass validation and only surface when a real
+  user request fails. This initiative adds a dashboard Ping control on each provider
+  row and each model row inside that provider. Clicking it sends one real minimal
+  completion (max_tokens: 1) through the existing chat-completions request path,
+  pinned to the clicked provider+model, and reports success or the upstream error.
+  The ping has full parity with a normal request: provider counters, circuit-breaker
+  feedback, the 3-entry request log, daily token accounting, and telemetry all update.
 in_scope:
   - id: "S1"
-    item: "Dual binding: listen on [server].host (Tailscale address) plus a dedicated 127.0.0.1 listener"
+    item: "POST /admin/ping relay endpoint: {provider, model} -> one real minimal completion via the shared chat-completions attempt path; JSON result with success/error, status, latency"
   - id: "S2"
-    item: "Replace the localhost-only guard with a tailnet/loopback guard on all routes so tailnet peers reach the dashboard and /v1 while the public interface reaches nothing (binding is the primary control; guard is defense in depth)"
+    item: "Dashboard Ping buttons: one per provider row and one per model row inside that provider; inline result display"
   - id: "S3"
-    item: "Dashboard raw TOML editor: load full config.toml as written, textarea editing, values visible, ${VAR} placeholders preserved"
+    item: "Shared attempt extraction: refactor create_chat_completions so the per-provider attempt is one function reused by the main route and the ping (no parallel implementation)"
   - id: "S4"
-    item: "Validate action: dry-run parse + Config::validate cross-references + unknown-field rejection; reports diagnostics without writing"
+    item: "Tests: unit + integration (mock upstream) proving ping success, ping failure, full parity (counters, breaker, request log, tokens), and route guard"
   - id: "S5"
-    item: "Apply action: validate -> write config.toml.bak (one generation) -> atomic replace -> in-process reload; 400 with diagnostics and zero writes on invalid input"
-  - id: "S6"
-    item: "Config plumbing for the new flows: strict unknown-field rejection in config structs; reload path reused for Apply"
-  - id: "S7"
-    item: "Tests: editor/validate/apply happy paths and failure paths, .bak generation, no-write-on-invalid, metrics-survive-reload, guard allows loopback + tailnet ranges and rejects others"
-  - id: "S8"
-    item: "Docs: handoff.md amendment (revision 2, already drafted) reflected in as-built docs; CHANGELOG entry"
+    item: "Gates: cargo fmt --check, clippy -D warnings, cargo test --workspace, release binary < 15 MB"
 out_of_scope:
-  - item: "Client key, IP allowlist, password auth, sessions, login page, lockout, rate limiting, TLS in oxllm"
-    why: "Dropped by the tailscale-only decision: tailnet membership is the single trust boundary (user-confirmed)"
-  - item: "Per-device access control inside oxllm"
-    why: "Deferred to tailnet ACLs, which own per-device policy"
-  - item: "Structured CRUD forms or key-masking layers"
-    why: "Superseded by the raw-editor decision; masking lost its rationale once the dashboard became tunnel/tailnet-trusted"
-  - item: "Client-key generation or strength validation"
-    why: "No client key exists; owner may write any TOML value by explicit choice"
-  - item: "Streaming SSE usage parsing"
-    why: "Pre-existing TODO from the previous epic; unchanged by this work"
-  - item: "VPS provisioning: tailscale install, firewall lockdown, old-stack teardown, musl deployment"
-    why: "Deploy-phase work, executed separately after the feature ships; this scope is code only"
-  - item: "Multi-user / multi-tenant accounts"
-    why: "Permanently excluded by user decision"
+  - item: "CLI ping, ping-all-at-one-click"
+    why: "User chose dashboard-only trigger"
+  - item: "Browser-to-upstream direct calls"
+    why: "CORS blocks most providers; oxllm relays the one request"
+  - item: "Changes to existing routing, virtual-model resolution, or /v1 endpoints"
+    why: "User: no additional feature; reuse existing functionality"
+  - item: "Auth, rate limiting, multi-tenancy"
+    why: "Tailnet is the trust boundary (Amendment A1)"
+  - item: "Ping history or persistence"
+    why: "In-memory only; the 3-entry request log already records pings"
 constraints:
   - "CLAUDE.md gates: cargo fmt --check, cargo clippy --workspace --all-targets -- -D warnings, stripped release binary < 15 MB, reqwest rustls-tls, no .unwrap()/.expect() in user-facing paths, lock-free hot path preserved"
-  - "The only runtime disk writes in the entire feature are the explicit config.toml.bak and its atomic replacement, both triggered by Apply"
-  - "Dashboard stays include_str!-embedded static HTML with vanilla JS; no build step, no new heavy dependencies"
-  - "Admin/dashboard write path must be a single explicit action; no background or scheduled writes"
-  - "Reload must reuse the existing ReloadableState/in-process reload machinery; no process restart, no new processes"
-  - "Behavior and public response shapes of existing endpoints stay backward compatible (status JSON, chat/embeddings, health)"
+  - "The ping reuses the main chat-completions request path unchanged: no new request-building logic"
+  - "Full parity: ping counts as a normal request (counters, breaker, request log, tokens, telemetry)"
+  - "Dashboard stays include_str!-embedded static HTML with vanilla JS; no build step, no new dependencies"
+  - "POST /admin/ping sits behind the tailnet guard and same-origin check like /config, /validate, /apply"
 success_criteria:
-  - "From a loopback connection: dashboard renders, /v1/chat/completions routes, /status and /health respond — all without any auth header"
-  - "From a simulated tailnet-range source: same results as loopback; the pure guard decision rejects public-range sources; configured host must reject 0.0.0.0 before bind (wildcard misbind is not a valid launch config)"
-  - "Validate reports precise diagnostics for syntax errors, unknown fields, dangling provider refs, and bad [api]-free schema without writing anything"
-  - "Apply on valid config: config.toml.bak created, file atomically replaced, reload applied, metrics counters continuous across the swap"
-  - "Apply on invalid config: HTTP 400 with parser/reference diagnostics, config.toml byte-identical, no .bak churn, service unaffected"
-  - "cargo test --workspace green including new suites; cargo fmt --check and strict clippy clean; release binary still under 15 MB"
+  - "Clicking Ping on a provider/model row sends one real minimal completion to that provider+model and shows success (with latency) or the upstream error inline"
+  - "A successful ping increments the provider request/success counters, records a request-log entry, and adds to daily token accounting — identical to a normal request"
+  - "A failed ping feeds circuit-breaker failure feedback exactly like a normal failed request"
+  - "cargo test --workspace green including new ping suites; cargo fmt --check and strict clippy clean; release binary still under 15 MB"
 references:
-  - "handoff.md — original binding spec; Amendment A1 revision 2 records this initiative's supersessions"
-  - "specs/planning-context.yaml — decision log from elaborate-spec + grill-me"
-  - "docs/handoff-completion.md — as-built record of the prior epic this builds on"
+  - "specs/planning-context.yaml — decision log from elaborate-spec"
+  - "handoff.md — Amendment A1 rev 2 (tailnet-only trust boundary)"
   - "CLAUDE.md — repo engineering gates"
+  - "specs/epics/e01-tailscale-gateway-editor/ — prior epic capsule (format reference)"
