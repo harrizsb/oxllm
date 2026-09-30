@@ -79,3 +79,16 @@ the middleware change. After registering the route all tests pass.
 - The dashboard change is markup/JS exercised by the dashboard content test
   (`/admin/ping` and `Ping` assertions); full browser interaction was not
   exercised in this environment.
+- An independent parity review found and fixed an observability gap: every
+  ping outcome now emits an info-level tracing event with provider, model,
+  status, and latency (including HTTP, transport, aborted, and skipped
+  failures). Success logs include status 200. The follow-up gate run after
+  this fix is listed below.
+
+## Follow-up observability fix gates
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean.
+- `cargo test --workspace`: 48 + 32 + 1 tests, 0 failed.
+- `cargo build --release`: `target/release/oxllm` 4,171,312 bytes
+  (< 15,728,640 limit).

@@ -1208,6 +1208,7 @@ pub async fn admin_ping(
                 request_id = %request_id,
                 provider = %payload.provider,
                 model = %payload.model,
+                status = 200,
                 latency_ms,
                 "Ping succeeded"
             );
@@ -1222,78 +1223,98 @@ pub async fn admin_ping(
             )
                 .into_response()
         },
-        ChatAttempt::HttpFailed { status, error, .. } => {
-            warn!(
-                request_id = %request_id,
-                provider = %payload.provider,
-                model = %payload.model,
-                status,
-                "Ping failed"
-            );
-            ping_failure_response(
-                &app_state,
-                &payload.model,
-                &payload.provider,
+        ChatAttempt::HttpFailed { status, error, .. } => ping_failure_response(
+            &app_state,
+            PingFailure {
+                request_id: &request_id,
+                model: &payload.model,
+                provider: &payload.provider,
                 status,
                 latency_ms,
                 error,
-            )
-        },
+            },
+        ),
         ChatAttempt::TransportFailed { provider: name } => ping_failure_response(
             &app_state,
-            &payload.model,
-            &payload.provider,
-            502,
-            latency_ms,
-            format!("Connection to provider {} failed", name),
+            PingFailure {
+                request_id: &request_id,
+                model: &payload.model,
+                provider: &payload.provider,
+                status: 502,
+                latency_ms,
+                error: format!("Connection to provider {} failed", name),
+            },
         ),
         ChatAttempt::Aborted { reason } => ping_failure_response(
             &app_state,
-            &payload.model,
-            &payload.provider,
-            502,
-            latency_ms,
-            reason,
-        ),
-        ChatAttempt::Skipped => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(PingResponse {
-                ok: false,
+            PingFailure {
+                request_id: &request_id,
+                model: &payload.model,
+                provider: &payload.provider,
                 status: 502,
                 latency_ms,
-                error: Some("Could not build the upstream ping request".to_string()),
-            }),
-        )
-            .into_response(),
+                error: reason,
+            },
+        ),
+        ChatAttempt::Skipped => {
+            info!(
+                request_id = %request_id,
+                provider = %payload.provider,
+                model = %payload.model,
+                status = 502,
+                latency_ms,
+                "Ping failed: could not build the upstream ping request"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(PingResponse {
+                    ok: false,
+                    status: 502,
+                    latency_ms,
+                    error: Some("Could not build the upstream ping request".to_string()),
+                }),
+            )
+                .into_response()
+        },
     }
 }
 
-/// Shared failure rendering for POST /admin/ping: records the request-log
-/// entry (502 for connection-level failures, mirroring the normal path\'s
-/// total-failure entry) and returns the JSON result.
-fn ping_failure_response(
-    app_state: &AppState,
-    model: &str,
-    provider: &str,
+/// Shared failure rendering for POST /admin/ping: logs the outcome at info
+/// level with provider, model, status, and latency (story e02s01 §13),
+/// records the request-log entry, and returns the JSON result.
+struct PingFailure<'a> {
+    request_id: &'a str,
+    model: &'a str,
+    provider: &'a str,
     status: u16,
     latency_ms: u128,
     error: String,
-) -> Response {
-    log_request(app_state, model, provider, 0, 0, status);
-    let error = if error.trim().is_empty() {
+}
+
+fn ping_failure_response(app_state: &AppState, f: PingFailure<'_>) -> Response {
+    info!(
+        request_id = %f.request_id,
+        provider = %f.provider,
+        model = %f.model,
+        status = f.status,
+        latency_ms = f.latency_ms,
+        "Ping failed"
+    );
+    log_request(app_state, f.model, f.provider, 0, 0, f.status);
+    let error = if f.error.trim().is_empty() {
         format!(
             "Provider {} returned HTTP {} with no error body",
-            provider, status
+            f.provider, f.status
         )
     } else {
-        error
+        f.error
     };
     (
         StatusCode::OK,
         Json(PingResponse {
             ok: false,
-            status,
-            latency_ms,
+            status: f.status,
+            latency_ms: f.latency_ms,
             error: Some(error),
         }),
     )
