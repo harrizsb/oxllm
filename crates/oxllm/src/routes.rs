@@ -370,6 +370,9 @@ pub async fn create_embeddings(
             .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", selected.api_key));
+        if let Some(user_agent) = selected.user_agent.as_deref() {
+            req = req.header(header::USER_AGENT, user_agent);
+        }
 
         // Propagate tracing headers if present
         if let Some(traceparent) = headers.get("traceparent") {
@@ -703,6 +706,9 @@ pub async fn create_chat_completions(
             .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", selected.api_key));
+        if let Some(user_agent) = selected.user_agent.as_deref() {
+            req = req.header(header::USER_AGENT, user_agent);
+        }
 
         if let Some(traceparent) = headers.get("traceparent") {
             req = req.header("traceparent", traceparent);

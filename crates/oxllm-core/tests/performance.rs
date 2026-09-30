@@ -15,6 +15,7 @@ async fn test_routing_loop_latency_performance() {
             name: format!("provider-{}", i),
             base_url: Url::parse("https://api.example.com").unwrap(),
             api_key: "key".to_string(),
+            user_agent: None,
             models: vec!["model-a".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),

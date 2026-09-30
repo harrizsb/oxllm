@@ -20,6 +20,7 @@ pub struct ProviderState {
     pub base_url: Url, // Parsed reqwest::Url to handle safe path joins and trailing slashes
     pub api_key: String,
     pub models: Vec<String>,
+    pub user_agent: Option<String>,
 
     // Protects volatile metrics without needing a write lock on the entire pool vector
     pub circuit: Arc<RwLock<CircuitState>>,
@@ -45,6 +46,7 @@ pub struct SelectedProvider {
     pub name: String,
     pub base_url: Url,
     pub api_key: String,
+    pub user_agent: Option<String>,
     pub is_probe: bool,
 }
 
@@ -154,6 +156,7 @@ mod swrr_tests {
                 name: name.to_string(),
                 base_url: Url::parse("https://example.com").unwrap(),
                 api_key: "key".to_string(),
+                user_agent: None,
                 models: vec!["model".to_string()],
                 circuit: Arc::new(RwLock::new(CircuitState::Closed)),
                 consecutive_failures: Arc::new(RwLock::new(0)),

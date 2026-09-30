@@ -24,6 +24,8 @@ pub struct ProviderConfig {
     pub base_url: String,
     pub api_key: String,
     pub models: Vec<String>,
+    #[serde(default)]
+    pub user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -209,6 +211,54 @@ pub fn expand_env_vars(raw_content: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_user_agent_is_optional_and_parsed() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = ""
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            user_agent = "pi/0.87.1 (linux; node/v24.20.0; x64)"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.providers[0].user_agent.as_deref(),
+            Some("pi/0.87.1 (linux; node/v24.20.0; x64)")
+        );
+    }
+
+    #[test]
+    fn provider_user_agent_defaults_to_none() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = ""
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.providers[0].user_agent, None);
+    }
 
     #[test]
     fn virtual_model_target_defaults_weight_to_one() {
