@@ -3139,6 +3139,40 @@ mod integration_tests {
         assert_eq!(target["successes"], 1);
     }
 
+    /// A ping against a HalfOpen provider claims and releases its probe slot.
+    #[tokio::test]
+    async fn test_integration_ping_half_open_releases_probe() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}]}"#;
+        let upstream = spawn_mock_upstream(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )])
+        .await;
+        let (_app_state, rs) = build_test_state(upstream);
+        let state = rs.app_state.clone();
+        *state.borrow().providers[0].circuit.write().await = CircuitState::HalfOpen;
+
+        let addr = spawn_test_router(rs).await;
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{}/admin/ping", addr))
+            .json(&serde_json::json!({"provider": "prov", "model": "model"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let result: Value = response.json().await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(
+            *state.borrow().providers[0].circuit.read().await,
+            CircuitState::Closed
+        );
+        assert!(!state.borrow().providers[0]
+            .probe_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     /// A failed ping returns ok:false with the upstream status and feeds
     /// circuit-breaker feedback exactly like a normal failed request.
     #[tokio::test]

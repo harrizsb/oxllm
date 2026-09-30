@@ -66,10 +66,12 @@ async function pingProviderModel(provider, model) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ provider, model }),
     });
-    const result = await response.json();
+    const raw = await response.text();
+    let result = null;
+    try { result = JSON.parse(raw); } catch { /* non-JSON body (e.g. limit rejection) */ }
     const text = response.ok
-      ? (result.ok ? `Success in ${result.latency_ms} ms` : `Failed (${result.status}): ${result.error || 'No details'}`)
-      : `Request rejected (${response.status}): ${result.error?.message || 'Invalid request'}`;
+      ? (result?.ok ? `Success in ${result.latency_ms} ms` : `Failed (${result?.status}): ${result?.error || 'No details'}`)
+      : `Request rejected (${response.status}): ${result?.error?.message || 'Invalid request'}`;
     pingStates.set(key, { busy: false, text });
   } catch (error) {
     pingStates.set(key, { busy: false, text: `Ping failed: ${error.message}` });

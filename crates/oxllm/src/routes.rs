@@ -1183,12 +1183,18 @@ pub async fn admin_ping(
     let headers = HeaderMap::new();
     let (trace_id, parent_span_id) = (None, None);
 
+    // HalfOpen providers need the probe permit to be released on outcome, so
+    // a ping acts as the HalfOpen probe exactly like a normal request would
+    // (lock-free permit, see AdaptivePriorityStrategy::select/feedback).
+    // Closed providers ignore is_probe in feedback.
+    let is_probe = matches!(*provider.circuit.read().await, CircuitState::HalfOpen);
+
     let outcome = attempt_chat_completion(
         &app_state,
         &telemetry,
         &request_id,
         provider,
-        false,
+        is_probe,
         &payload.model,
         &ping_payload,
         &headers,
