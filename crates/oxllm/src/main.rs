@@ -10,7 +10,7 @@ use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 use axum::{
     body::Body,
-    extract::ConnectInfo,
+    extract::{ConnectInfo, DefaultBodyLimit},
     http::{header, HeaderValue, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -1055,6 +1055,16 @@ async fn handle_post_apply(
     }
 }
 
+/// Maximum accepted JSON body for the editor endpoints (/validate and /apply).
+const EDITOR_BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+async fn editor_json_body_limit(mut request: Request<Body>, next: Next) -> Response {
+    if matches!(request.uri().path(), "/validate" | "/apply") {
+        DefaultBodyLimit::max(EDITOR_BODY_LIMIT_BYTES).apply(&mut request);
+    }
+    next.run(request).await
+}
+
 fn build_router(reloadable_state: ReloadableState) -> axum::Router {
     use axum::routing::{get, post};
     axum::Router::new()
@@ -1088,6 +1098,7 @@ fn build_router(reloadable_state: ReloadableState) -> axum::Router {
         .route("/admin/providers/{name}/reset", post(routes::admin_reset))
         .layer(middleware::from_fn(tailnet_only))
         .layer(middleware::from_fn(add_request_id))
+        .layer(middleware::from_fn(editor_json_body_limit))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -3459,8 +3470,10 @@ models = ["model"]
             .method(method)
             .uri(uri)
             .header(header::HOST, "127.0.0.1:8080");
-        if body.is_some() {
-            builder = builder.header(header::CONTENT_TYPE, "application/json");
+        if let Some(bytes) = body.as_ref() {
+            builder = builder
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, bytes.len());
         }
         let mut request = builder
             .body(body.map_or_else(Body::empty, Body::from))
@@ -3489,6 +3502,21 @@ models = ["model"]
             .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         (status, value)
+    }
+
+    #[tokio::test]
+    async fn editor_json_body_limit_rejects_over_1_mib() {
+        let router = editor_router(std::path::PathBuf::from("unused-config.toml")).await;
+        let oversized = serde_json::json!({"config": "x".repeat(1_048_576)}).to_string();
+        let response = router
+            .oneshot(editor_request(
+                "POST",
+                "/validate",
+                Some(oversized.into_bytes()),
+            ))
+            .await
+            .expect("router answers oversized request");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     async fn editor_router(config_path: std::path::PathBuf) -> axum::Router {
@@ -4023,6 +4051,35 @@ vm3 = [{ provider = "prov3", model = "m3" }]
             std::fs::read_to_string(&backup_path).unwrap(),
             UPDATED_APPLY_CONFIG,
             "one-generation backup must hold the second config, not the original"
+        );
+        let _ = dir;
+    }
+
+    #[tokio::test]
+    async fn apply_body_over_limit_rejected_413_without_writes() {
+        let (dir, reloader, router) = setup_apply_fixture(ReloadIo::default());
+        let backup_path = reloader.config_path.with_extension("toml.bak");
+        let oversized = serde_json::json!({ "config": "x".repeat(1_048_576) }).to_string();
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/apply")
+            .header(header::HOST, "127.0.0.1:8080")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, oversized.len())
+            .body(Body::from(oversized))
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345u16))));
+        let response = router.oneshot(request).await.expect("apply response");
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            std::fs::read_to_string(&reloader.config_path).unwrap(),
+            BASE_APPLY_CONFIG
+        );
+        assert!(
+            !backup_path.exists(),
+            "no backup may be created for an over-limit body"
         );
         let _ = dir;
     }
