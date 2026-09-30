@@ -1,0 +1,22 @@
+id: e02
+title: Provider-model ping through the main request path
+wsjf: 4.0
+total_bcps: 3
+status: in_progress
+stories:
+- id: e02s01
+  title: 'Ping: per-provider, per-model real request via the shared chat path'
+  bcps: 3
+  status: todo
+  spec: e02s01-ping-provider-model.md
+  tasks: e02s01-tasks.yaml
+  delta:
+  - type: ADDED
+    ref: POST /admin/ping
+    summary: Bounded application/json {provider, model}; same-origin Origin check when present; one real minimal completion (max_tokens 1) through the shared chat-completions attempt path pinned to that provider+model; JSON result with success/error, status, latency
+  - type: MODIFIED
+    ref: create_chat_completions
+    summary: Extract the per-provider attempt into one shared helper; the main route and the ping both call it — no parallel request logic
+  - type: ADDED
+    ref: dashboard.html
+    summary: Ping button per provider row and per model row; inline result display (vanilla JS, still include_str!-embedded)
