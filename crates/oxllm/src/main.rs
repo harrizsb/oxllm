@@ -839,7 +839,7 @@ fn editor_origin_matches_host(origin: &HeaderValue, host: &HeaderValue) -> bool 
     };
     // Scheme is syntax-checked, but authority is compared to Host because the
     // gateway may sit behind an HTTPS-terminating Tailscale/reverse proxy.
-    if !matches!(origin_url.scheme(), "http" | "https")
+    if origin_url.scheme() != "http"
         || origin_url.username() != ""
         || origin_url.password().is_some()
         || origin_url.path() != "/"
@@ -3749,7 +3749,7 @@ models = ["model"]
     }
 
     #[test]
-    fn origin_policy_matches_same_authority_and_rejects_mismatches() {
+    fn origin_policy_requires_http_and_rejects_mismatches() {
         // Same-origin, explicit and implicit ports.
         assert!(editor_origin_matches_host(
             &HeaderValue::from_static("http://127.0.0.1:8080"),
@@ -3759,7 +3759,9 @@ models = ["model"]
             &HeaderValue::from_static("http://host.example"),
             &HeaderValue::from_static("host.example"),
         ));
-        assert!(editor_origin_matches_host(
+        // The deployment contract is plain HTTP over Tailscale; HTTPS origins
+        // do not match this listener and must be rejected.
+        assert!(!editor_origin_matches_host(
             &HeaderValue::from_static("https://host.example"),
             &HeaderValue::from_static("host.example"),
         ));
