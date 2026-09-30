@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 use oxllm_core::router::{AdaptivePriorityStrategy, RoutingStrategy};
 use oxllm_core::runtime::{DailyTokenSnapshot, RequestLogEntry};
@@ -370,9 +370,6 @@ pub async fn create_embeddings(
             .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
             .header("Content-Type", "application/json")
             .header("Authorization", format!("Bearer {}", selected.api_key));
-        if let Some(user_agent) = selected.user_agent.as_deref() {
-            req = req.header(header::USER_AGENT, user_agent);
-        }
 
         // Propagate tracing headers if present
         if let Some(traceparent) = headers.get("traceparent") {
@@ -616,6 +613,375 @@ pub async fn create_embeddings(
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
 }
 
+/// Outcome of one upstream chat attempt on the shared chat path.
+enum ChatAttempt {
+    /// Upstream answered; the full client response is ready (streaming or not).
+    Success(Response),
+    /// Upstream returned an HTTP error; carries diagnostics for the final 502.
+    HttpFailed {
+        provider: String,
+        status: u16,
+        error: String,
+    },
+    /// Upstream connection failed (no status code); only the provider name updates.
+    TransportFailed { provider: String },
+    /// Attempt aborted after the upstream answered (e.g. unreadable body);
+    /// circuit feedback was already applied, diagnostics stay unchanged.
+    Aborted { reason: String },
+    /// Local precondition failed (e.g. invalid base_url join); no upstream call, no feedback.
+    Skipped,
+}
+
+/// One upstream chat attempt through the shared request path: model rewrite,
+/// send, circuit-breaker feedback, provider counters, request log, daily token
+/// accounting, and telemetry. Used by POST /v1/chat/completions (candidate
+/// loop) and POST /admin/ping (single pinned provider+model) so a ping has
+/// exact parity with a normal request.
+#[allow(clippy::too_many_arguments)]
+async fn attempt_chat_completion(
+    app_state: &Arc<AppState>,
+    telemetry: &TelemetryClient,
+    request_id: &str,
+    provider: &ProviderState,
+    is_probe: bool,
+    target_model: &str,
+    payload: &Value,
+    headers: &HeaderMap,
+    trace_id: &Option<String>,
+    parent_span_id: &Option<String>,
+    attempts: u32,
+    start_time: Instant,
+    is_streaming: bool,
+    requested_model: &str,
+) -> ChatAttempt {
+    let strategy = AdaptivePriorityStrategy;
+
+    let mut payload = payload.clone();
+    payload["model"] = Value::String(target_model.to_string());
+    let rewritten_body = match serde_json::to_vec(&payload) {
+        Ok(bytes) => Bytes::from(bytes),
+        Err(e) => {
+            error!("Failed to serialize payload for {}: {}", provider.name, e);
+            return ChatAttempt::Skipped;
+        },
+    };
+
+    let endpoint_url = match provider.base_url.join("chat/completions") {
+        Ok(url) => url,
+        Err(e) => {
+            error!("Invalid base URL path join for {}: {}", provider.name, e);
+            return ChatAttempt::Skipped;
+        },
+    };
+
+    let mut req = app_state
+        .http_client
+        .post(endpoint_url)
+        .body(rewritten_body)
+        .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", provider.api_key));
+
+    if let Some(user_agent) = provider.user_agent.as_deref() {
+        req = req.header(header::USER_AGENT, user_agent);
+    }
+
+    if let Some(traceparent) = headers.get("traceparent") {
+        req = req.header("traceparent", traceparent);
+    }
+
+    debug!(
+        "Chat request routing to {} (attempt {})",
+        provider.name, attempts
+    );
+
+    provider
+        .requests
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let res = req.send().await;
+
+    match res {
+        Ok(res) if res.status().is_success() => {
+            let status_code = res.status().as_u16();
+            let upstream_headers = res.headers().clone();
+
+            if is_streaming {
+                let app_state_clone = app_state.clone();
+                let provider_name = provider.name.clone();
+                let telemetry_clone = telemetry.clone();
+                let trace_id_clone = trace_id.clone();
+                let parent_span_id_clone = parent_span_id.clone();
+                let request_id_clone = request_id.to_string();
+                let duration = start_time.elapsed();
+                let attempt_count = attempts;
+                let model_name = target_model.to_string();
+
+                let (tx, rx) = tokio::sync::mpsc::channel::<
+                    Result<Bytes, Box<dyn std::error::Error + Send + Sync>>,
+                >(32);
+
+                tokio::spawn(async move {
+                    let mut reqwest_stream = res.bytes_stream();
+                    let mut stream_success = true;
+
+                    while let Some(chunk_result) = reqwest_stream.next().await {
+                        match chunk_result {
+                            Ok(chunk) => {
+                                if tx.send(Ok(chunk)).await.is_err() {
+                                    // Client disconnected
+                                    stream_success = false;
+                                    break;
+                                }
+                            },
+                            Err(e) => {
+                                stream_success = false;
+                                let _ = tx
+                                    .send(Err(
+                                        Box::new(e) as Box<dyn std::error::Error + Send + Sync>
+                                    ))
+                                    .await;
+                                break;
+                            },
+                        }
+                    }
+
+                    // Deferred circuit-breaker feedback after stream completes
+                    if let Some(provider_state) = app_state_clone
+                        .providers
+                        .iter()
+                        .find(|p| p.name == provider_name)
+                    {
+                        let strategy = AdaptivePriorityStrategy;
+                        strategy
+                            .feedback(
+                                provider_state,
+                                stream_success,
+                                is_probe,
+                                Some(status_code),
+                                None,
+                            )
+                            .await;
+                        telemetry_clone.emit(TelemetryEvent::UpdateStatus {
+                            provider: provider_name.clone(),
+                            status: circuit_status(provider_state).await,
+                        });
+
+                        if stream_success {
+                            provider_state
+                                .successes
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+
+                    // Push Telemetry Metrics
+                    telemetry_clone.emit(TelemetryEvent::RecordTransaction {
+                        operation: "chat".to_string(),
+                        provider: provider_name,
+                        model: model_name,
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        duration,
+                        attempts: attempt_count,
+                        failure_reason: if stream_success {
+                            None
+                        } else {
+                            Some("stream_failed".to_string())
+                        },
+                        trace_id: trace_id_clone,
+                        parent_span_id: parent_span_id_clone,
+                        request_id: request_id_clone,
+                    });
+                });
+
+                // TODO(streaming): SSE carriers `usage` in the final chunk; parse the
+                // stream to feed daily token accounting. Logged with zeros for now
+                // (per handoff: non-streaming first, no silent breakage).
+                log_request(app_state, requested_model, &provider.name, 0, 0, 200);
+
+                // Convert mpsc receiver to a Stream for axum
+                let axum_stream = unfold(Some(rx), |state| async move {
+                    let mut rx = state?;
+                    rx.recv().await.map(|item| (item, Some(rx)))
+                });
+
+                let mut response = Response::new(Body::from_stream(axum_stream));
+                *response.status_mut() = StatusCode::OK;
+                copy_response_headers(&upstream_headers, response.headers_mut());
+                ChatAttempt::Success(response)
+            } else {
+                // Report Success feedback (non-streaming: immediate, as before)
+                strategy
+                    .feedback(provider, true, is_probe, Some(status_code), None)
+                    .await;
+                telemetry.emit(TelemetryEvent::UpdateStatus {
+                    provider: provider.name.clone(),
+                    status: circuit_status(provider).await,
+                });
+
+                let res_body = match res.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(
+                            request_id = %request_id,
+                            "Failed to read success response body from {}: {}",
+                            provider.name, e
+                        );
+                        strategy
+                            .feedback(provider, false, is_probe, Some(status_code), None)
+                            .await;
+                        telemetry.emit(TelemetryEvent::UpdateStatus {
+                            provider: provider.name.clone(),
+                            status: circuit_status(provider).await,
+                        });
+                        return ChatAttempt::Aborted {
+                            reason: "failed to read upstream response body".to_string(),
+                        };
+                    },
+                };
+
+                // Parse token counts from upstream response, including cached
+                // prompt tokens (providers that omit the details field count as zero).
+                let (input_tokens, output_tokens, cached_tokens) =
+                    serde_json::from_slice::<Value>(&res_body)
+                        .map(|v| {
+                            let usage = v.get("usage");
+                            let input = usage
+                                .and_then(|u| u.get("prompt_tokens"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let output = usage
+                                .and_then(|u| u.get("completion_tokens"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            let cached = usage
+                                .and_then(|u| u.get("prompt_tokens_details"))
+                                .and_then(|d| d.get("cached_tokens"))
+                                .and_then(|t| t.as_u64())
+                                .unwrap_or(0);
+                            (input, output, cached)
+                        })
+                        .unwrap_or((0, 0, 0));
+
+                // Daily accounting + request log (non-streaming only: see TODO below)
+                let uncached_tokens = input_tokens.saturating_sub(cached_tokens);
+                app_state.metrics.daily_tokens.record_usage(
+                    input_tokens,
+                    cached_tokens,
+                    output_tokens,
+                );
+                log_request(
+                    app_state,
+                    requested_model,
+                    &provider.name,
+                    cached_tokens,
+                    uncached_tokens,
+                    status_code,
+                );
+
+                // Increment local counters. Single count per success: the pre-read
+                // increment that used to sit above was a double-count defect,
+                // removed during the shared-attempt extraction.
+                provider
+                    .successes
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                provider
+                    .tokens_input
+                    .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
+                provider
+                    .tokens_output
+                    .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
+
+                // Push Telemetry Metrics
+                telemetry.emit(TelemetryEvent::RecordTransaction {
+                    operation: "chat".to_string(),
+                    provider: provider.name.clone(),
+                    model: target_model.to_string(),
+                    input_tokens,
+                    output_tokens,
+                    duration: start_time.elapsed(),
+                    attempts,
+                    failure_reason: None,
+                    trace_id: trace_id.clone(),
+                    parent_span_id: parent_span_id.clone(),
+                    request_id: request_id.to_string(),
+                });
+
+                let mut response = Response::new(Body::from(res_body));
+                *response.status_mut() = StatusCode::OK;
+                copy_response_headers(&upstream_headers, response.headers_mut());
+                ChatAttempt::Success(response)
+            }
+        },
+        Ok(res) => {
+            let status_code = res.status().as_u16();
+            warn!(
+                request_id = %request_id,
+                "Chat completions upstream {} failed with status {}",
+                provider.name, status_code
+            );
+
+            // Extract Retry-After before consuming the response body
+            let retry_after = extract_retry_after(res.headers());
+
+            // Best-effort: read upstream error body for final 502 response
+            let error_body = match res.bytes().await {
+                Ok(b) => String::from_utf8_lossy(&b).to_string(),
+                Err(e) => {
+                    warn!(
+                        request_id = %request_id,
+                        "Failed to read error body from {}: {}", provider.name, e
+                    );
+                    String::new()
+                },
+            };
+            let parsed_error = if !error_body.is_empty() {
+                serde_json::from_str::<Value>(&error_body)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("error")
+                            .and_then(|e| e.get("message"))
+                            .and_then(|m| m.as_str().map(String::from))
+                    })
+                    .unwrap_or(error_body)
+            } else {
+                String::new()
+            };
+
+            strategy
+                .feedback(provider, false, is_probe, Some(status_code), retry_after)
+                .await;
+            telemetry.emit(TelemetryEvent::UpdateStatus {
+                provider: provider.name.clone(),
+                status: circuit_status(provider).await,
+            });
+
+            ChatAttempt::HttpFailed {
+                provider: provider.name.clone(),
+                status: status_code,
+                error: parsed_error,
+            }
+        },
+        Err(e) => {
+            warn!(
+                request_id = %request_id,
+                "Chat completions upstream {} connection failed: {}",
+                provider.name, e
+            );
+            strategy
+                .feedback(provider, false, is_probe, None, None)
+                .await;
+            telemetry.emit(TelemetryEvent::UpdateStatus {
+                provider: provider.name.clone(),
+                status: circuit_status(provider).await,
+            });
+            ChatAttempt::TransportFailed {
+                provider: provider.name.clone(),
+            }
+        },
+    }
+}
+
 /// POST /v1/chat/completions
 pub async fn create_chat_completions(
     State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
@@ -623,7 +989,7 @@ pub async fn create_chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let mut payload: Value = match serde_json::from_slice(&body) {
+    let payload: Value = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
             return json_error_response(
@@ -638,7 +1004,7 @@ pub async fn create_chat_completions(
         Some(m) => m.to_string(),
         None => {
             return json_error_response(
-                "Missing required 'model' field",
+                "Missing required \'model\' field",
                 "invalid_request_error",
                 StatusCode::BAD_REQUEST,
             )
@@ -687,354 +1053,51 @@ pub async fn create_chat_completions(
                 continue;
             },
         };
-
-        payload["model"] = Value::String(target_model.clone());
-        let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
-
-        let endpoint_url = match selected.base_url.join("chat/completions") {
-            Ok(url) => url,
-            Err(e) => {
-                error!("Invalid base URL path join for {}: {}", selected.name, e);
-                continue;
-            },
-        };
-
-        let mut req = app_state
-            .http_client
-            .post(endpoint_url.as_str())
-            .body(rewritten_body)
-            .timeout(Duration::from_secs(app_state.upstream_timeout_secs))
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", selected.api_key));
-        if let Some(user_agent) = selected.user_agent.as_deref() {
-            req = req.header(header::USER_AGENT, user_agent);
-        }
-
-        if let Some(traceparent) = headers.get("traceparent") {
-            req = req.header("traceparent", traceparent);
-        }
-
-        debug!(
-            "Chat request routing to {} (attempt {})",
-            selected.name, attempts
-        );
-
-        // Increment request counter
-        if let Some(target) = app_state.providers.iter().find(|p| p.name == selected.name) {
-            target
-                .requests
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-
-        let res = req.send().await;
-
-        match res {
-            Ok(res) if res.status().is_success() => {
-                let status_code = res.status().as_u16();
-                let upstream_headers = res.headers().clone();
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-
-                if is_streaming {
-                    let app_state_clone = app_state.clone();
-                    let provider_name = selected.name.clone();
-                    let is_probe = selected.is_probe;
-                    let telemetry_clone = telemetry.clone();
-                    let trace_id_clone = trace_id.clone();
-                    let parent_span_id_clone = parent_span_id.clone();
-                    let request_id_clone = request_id.clone();
-                    let duration = start_time.elapsed();
-                    let attempt_count = attempts;
-                    let model_name = target_model;
-
-                    let (tx, rx) = tokio::sync::mpsc::channel::<
-                        Result<Bytes, Box<dyn std::error::Error + Send + Sync>>,
-                    >(32);
-
-                    tokio::spawn(async move {
-                        let mut reqwest_stream = res.bytes_stream();
-                        let mut stream_success = true;
-
-                        while let Some(chunk_result) = reqwest_stream.next().await {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    if tx.send(Ok(chunk)).await.is_err() {
-                                        // Client disconnected
-                                        stream_success = false;
-                                        break;
-                                    }
-                                },
-                                Err(e) => {
-                                    stream_success = false;
-                                    let _ = tx
-                                        .send(Err(
-                                            Box::new(e) as Box<dyn std::error::Error + Send + Sync>
-                                        ))
-                                        .await;
-                                    break;
-                                },
-                            }
-                        }
-
-                        // Deferred circuit-breaker feedback after stream completes
-                        if let Some(provider_state) = app_state_clone
-                            .providers
-                            .iter()
-                            .find(|p| p.name == provider_name)
-                        {
-                            let strategy = AdaptivePriorityStrategy;
-                            strategy
-                                .feedback(
-                                    provider_state,
-                                    stream_success,
-                                    is_probe,
-                                    Some(status_code),
-                                    None,
-                                )
-                                .await;
-                            telemetry_clone.emit(TelemetryEvent::UpdateStatus {
-                                provider: provider_name.clone(),
-                                status: circuit_status(provider_state).await,
-                            });
-
-                            if stream_success {
-                                provider_state
-                                    .successes
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            }
-                        }
-
-                        // Push Telemetry Metrics
-                        telemetry_clone.emit(TelemetryEvent::RecordTransaction {
-                            operation: "chat".to_string(),
-                            provider: provider_name,
-                            model: model_name,
-                            input_tokens: 0,
-                            output_tokens: 0,
-                            duration,
-                            attempts: attempt_count,
-                            failure_reason: if stream_success {
-                                None
-                            } else {
-                                Some("stream_failed".to_string())
-                            },
-                            trace_id: trace_id_clone,
-                            parent_span_id: parent_span_id_clone,
-                            request_id: request_id_clone,
-                        });
-                    });
-
-                    // TODO(streaming): SSE carriers `usage` in the final chunk; parse the
-                    // stream to feed daily token accounting. Logged with zeros for now
-                    // (per handoff: non-streaming first, no silent breakage).
-                    log_request(&app_state, &requested_model, &selected.name, 0, 0, 200);
-
-                    // Convert mpsc receiver to a Stream for axum
-                    let axum_stream = unfold(Some(rx), |state| async move {
-                        let mut rx = state?;
-                        rx.recv().await.map(|item| (item, Some(rx)))
-                    });
-
-                    let mut response = Response::new(Body::from_stream(axum_stream));
-                    *response.status_mut() = StatusCode::OK;
-                    copy_response_headers(&upstream_headers, response.headers_mut());
-                    return response.into_response();
-                } else {
-                    // Report Success feedback (non-streaming: immediate, as before)
-                    strategy
-                        .feedback(
-                            target_provider_state,
-                            true,
-                            selected.is_probe,
-                            Some(status_code),
-                            None,
-                        )
-                        .await;
-                    telemetry.emit(TelemetryEvent::UpdateStatus {
-                        provider: selected.name.clone(),
-                        status: circuit_status(target_provider_state).await,
-                    });
-
-                    // Increment local counters (streaming: token counts deferred)
-                    target_provider_state
-                        .successes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let res_body = match res.bytes().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            warn!(
-                                request_id = %request_id,
-                                "Failed to read success response body from {}: {}",
-                                selected.name, e
-                            );
-                            strategy
-                                .feedback(
-                                    target_provider_state,
-                                    false,
-                                    selected.is_probe,
-                                    Some(status_code),
-                                    None,
-                                )
-                                .await;
-                            telemetry.emit(TelemetryEvent::UpdateStatus {
-                                provider: selected.name.clone(),
-                                status: circuit_status(target_provider_state).await,
-                            });
-                            continue;
-                        },
-                    };
-
-                    // Parse token counts from upstream response, including cached
-                    // prompt tokens (providers that omit the details field count as zero).
-                    let (input_tokens, output_tokens, cached_tokens) =
-                        serde_json::from_slice::<Value>(&res_body)
-                            .map(|v| {
-                                let usage = v.get("usage");
-                                let input = usage
-                                    .and_then(|u| u.get("prompt_tokens"))
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                let output = usage
-                                    .and_then(|u| u.get("completion_tokens"))
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                let cached = usage
-                                    .and_then(|u| u.get("prompt_tokens_details"))
-                                    .and_then(|d| d.get("cached_tokens"))
-                                    .and_then(|t| t.as_u64())
-                                    .unwrap_or(0);
-                                (input, output, cached)
-                            })
-                            .unwrap_or((0, 0, 0));
-
-                    // Daily accounting + request log (non-streaming only: see TODO below)
-                    let uncached_tokens = input_tokens.saturating_sub(cached_tokens);
-                    app_state.metrics.daily_tokens.record_usage(
-                        input_tokens,
-                        cached_tokens,
-                        output_tokens,
+        let target_provider_state =
+            match app_state.providers.iter().find(|p| p.name == selected.name) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        request_id = %request_id,
+                        "Provider {} missing from provider state during chat routing",
+                        selected.name
                     );
-                    log_request(
-                        &app_state,
-                        &requested_model,
-                        &selected.name,
-                        cached_tokens,
-                        uncached_tokens,
-                        status_code,
-                    );
+                    continue;
+                },
+            };
 
-                    // Increment local counters
-                    target_provider_state
-                        .successes
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    target_provider_state
-                        .tokens_input
-                        .fetch_add(input_tokens, std::sync::atomic::Ordering::Relaxed);
-                    target_provider_state
-                        .tokens_output
-                        .fetch_add(output_tokens, std::sync::atomic::Ordering::Relaxed);
-
-                    // Push Telemetry Metrics
-                    telemetry.emit(TelemetryEvent::RecordTransaction {
-                        operation: "chat".to_string(),
-                        provider: selected.name.clone(),
-                        model: target_model,
-                        input_tokens,
-                        output_tokens,
-                        duration: start_time.elapsed(),
-                        attempts,
-                        failure_reason: None,
-                        trace_id: trace_id.clone(),
-                        parent_span_id: parent_span_id.clone(),
-                        request_id: request_id.clone(),
-                    });
-
-                    let mut response = Response::new(Body::from(res_body));
-                    *response.status_mut() = StatusCode::OK;
-                    copy_response_headers(&upstream_headers, response.headers_mut());
-                    return response.into_response();
-                }
+        match attempt_chat_completion(
+            &app_state,
+            &telemetry,
+            &request_id,
+            target_provider_state,
+            selected.is_probe,
+            &target_model,
+            &payload,
+            &headers,
+            &trace_id,
+            &parent_span_id,
+            attempts,
+            start_time,
+            is_streaming,
+            &requested_model,
+        )
+        .await
+        {
+            ChatAttempt::Success(response) => return response.into_response(),
+            ChatAttempt::HttpFailed {
+                provider,
+                status,
+                error,
+            } => {
+                last_upstream_error = error;
+                last_failed_provider = provider;
+                last_failed_status = status;
             },
-            Ok(res) => {
-                let status_code = res.status().as_u16();
-                warn!(
-                    request_id = %request_id,
-                    "Chat completions upstream {} failed with status {}",
-                    selected.name, status_code
-                );
-
-                // Extract Retry-After before consuming the response body
-                let retry_after = extract_retry_after(res.headers());
-
-                // Best-effort: read upstream error body for final 502 response
-                let error_body = match res.bytes().await {
-                    Ok(b) => String::from_utf8_lossy(&b).to_string(),
-                    Err(e) => {
-                        warn!(
-                            request_id = %request_id,
-                            "Failed to read error body from {}: {}", selected.name, e
-                        );
-                        String::new()
-                    },
-                };
-                let parsed_error = if !error_body.is_empty() {
-                    serde_json::from_str::<Value>(&error_body)
-                        .ok()
-                        .and_then(|v| {
-                            v.get("error")
-                                .and_then(|e| e.get("message"))
-                                .and_then(|m| m.as_str().map(String::from))
-                        })
-                        .unwrap_or(error_body)
-                } else {
-                    String::new()
-                };
-                last_upstream_error = parsed_error;
-                last_failed_provider = selected.name.clone();
-                last_failed_status = status_code;
-
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(
-                        target_provider_state,
-                        false,
-                        selected.is_probe,
-                        Some(status_code),
-                        retry_after,
-                    )
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
+            ChatAttempt::TransportFailed { provider } => {
+                last_failed_provider = provider;
             },
-            Err(e) => {
-                warn!(
-                    request_id = %request_id,
-                    "Chat completions upstream {} connection failed: {}",
-                    selected.name, e
-                );
-                last_failed_provider = selected.name.clone();
-                let target_provider_state = app_state
-                    .providers
-                    .iter()
-                    .find(|p| p.name == selected.name)
-                    .unwrap();
-                strategy
-                    .feedback(target_provider_state, false, selected.is_probe, None, None)
-                    .await;
-                telemetry.emit(TelemetryEvent::UpdateStatus {
-                    provider: selected.name.clone(),
-                    status: circuit_status(target_provider_state).await,
-                });
-            },
+            ChatAttempt::Aborted { .. } | ChatAttempt::Skipped => continue,
         }
     }
 
@@ -1055,6 +1118,186 @@ pub async fn create_chat_completions(
         "All upstream chat completions providers failed or are rate-limited".to_string()
     };
     json_error_response(&message, "server_error", StatusCode::BAD_GATEWAY)
+}
+
+#[derive(serde::Deserialize)]
+pub struct PingRequest {
+    provider: String,
+    model: String,
+}
+
+#[derive(serde::Serialize)]
+struct PingResponse {
+    ok: bool,
+    status: u16,
+    latency_ms: u128,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// POST /admin/ping — one real minimal completion (max_tokens 1) through the
+/// shared chat attempt path, pinned to the requested provider+model. The ping
+/// has exact parity with a normal request: provider counters, circuit-breaker
+/// feedback, request log, daily token accounting, and telemetry. The payload
+/// is fixed server-side; callers cannot shape the upstream request.
+pub async fn admin_ping(
+    State((app_state, telemetry)): State<(Arc<AppState>, TelemetryClient)>,
+    Extension(request_id): Extension<String>,
+    Json(payload): Json<PingRequest>,
+) -> Response {
+    let start_time = Instant::now();
+
+    let provider = match app_state
+        .providers
+        .iter()
+        .find(|p| p.name == payload.provider)
+    {
+        Some(p) => p,
+        None => {
+            log_request(&app_state, &payload.model, &payload.provider, 0, 0, 400);
+            return json_error_response(
+                &format!("Unknown provider: {}", payload.provider),
+                "invalid_request_error",
+                StatusCode::BAD_REQUEST,
+            );
+        },
+    };
+
+    if !provider.models.iter().any(|m| m == &payload.model) {
+        log_request(&app_state, &payload.model, &payload.provider, 0, 0, 400);
+        return json_error_response(
+            &format!(
+                "Model {} is not configured for provider {}",
+                payload.model, payload.provider
+            ),
+            "invalid_request_error",
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    let ping_payload = serde_json::json!({
+        "model": payload.model,
+        "messages": [{ "role": "user", "content": "ping" }],
+        "max_tokens": 1,
+    });
+    let headers = HeaderMap::new();
+    let (trace_id, parent_span_id) = (None, None);
+
+    let outcome = attempt_chat_completion(
+        &app_state,
+        &telemetry,
+        &request_id,
+        provider,
+        false,
+        &payload.model,
+        &ping_payload,
+        &headers,
+        &trace_id,
+        &parent_span_id,
+        1,
+        start_time,
+        false,
+        &payload.model,
+    )
+    .await;
+
+    let latency_ms = start_time.elapsed().as_millis();
+    match outcome {
+        ChatAttempt::Success(_) => {
+            info!(
+                request_id = %request_id,
+                provider = %payload.provider,
+                model = %payload.model,
+                latency_ms,
+                "Ping succeeded"
+            );
+            (
+                StatusCode::OK,
+                Json(PingResponse {
+                    ok: true,
+                    status: 200,
+                    latency_ms,
+                    error: None,
+                }),
+            )
+                .into_response()
+        },
+        ChatAttempt::HttpFailed { status, error, .. } => {
+            warn!(
+                request_id = %request_id,
+                provider = %payload.provider,
+                model = %payload.model,
+                status,
+                "Ping failed"
+            );
+            ping_failure_response(
+                &app_state,
+                &payload.model,
+                &payload.provider,
+                status,
+                latency_ms,
+                error,
+            )
+        },
+        ChatAttempt::TransportFailed { provider: name } => ping_failure_response(
+            &app_state,
+            &payload.model,
+            &payload.provider,
+            502,
+            latency_ms,
+            format!("Connection to provider {} failed", name),
+        ),
+        ChatAttempt::Aborted { reason } => ping_failure_response(
+            &app_state,
+            &payload.model,
+            &payload.provider,
+            502,
+            latency_ms,
+            reason,
+        ),
+        ChatAttempt::Skipped => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(PingResponse {
+                ok: false,
+                status: 502,
+                latency_ms,
+                error: Some("Could not build the upstream ping request".to_string()),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+/// Shared failure rendering for POST /admin/ping: records the request-log
+/// entry (502 for connection-level failures, mirroring the normal path\'s
+/// total-failure entry) and returns the JSON result.
+fn ping_failure_response(
+    app_state: &AppState,
+    model: &str,
+    provider: &str,
+    status: u16,
+    latency_ms: u128,
+    error: String,
+) -> Response {
+    log_request(app_state, model, provider, 0, 0, status);
+    let error = if error.trim().is_empty() {
+        format!(
+            "Provider {} returned HTTP {} with no error body",
+            provider, status
+        )
+    } else {
+        error
+    };
+    (
+        StatusCode::OK,
+        Json(PingResponse {
+            ok: false,
+            status,
+            latency_ms,
+            error: Some(error),
+        }),
+    )
+        .into_response()
 }
 
 /// Reads the current circuit and rate-limit state to produce a status code

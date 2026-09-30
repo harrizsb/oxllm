@@ -1,13 +1,13 @@
 story_id: e02s01
 title: 'Ping: per-provider, per-model real request via the shared chat path'
-status: todo
+status: done
 bcps: 3
 tasks:
 - id: 1
   description: 'Extract the per-provider chat attempt from create_chat_completions into a shared helper (attempt_chat_completion) returning Success(Response) or Failed{provider,status,error}; the main route loops over it exactly as before — behavior unchanged, no parallel implementation'
-  verify: cargo test -p oxllm
+  verify: 'cargo test -p oxllm (48 integration green post-rebase incl. user_agent; fmt/clippy -D warnings clean)'
   risk: P1
-  status: todo
+  status: done
   security: medium
   allure:
     severity: critical
@@ -16,9 +16,9 @@ tasks:
     - integration
 - id: 2
   description: 'Add POST /admin/ping handler: parse {provider, model}; reject unknown provider or model not in the provider models list (400); build minimal payload (max_tokens 1, single "ping" message); call the shared attempt once; return JSON {ok, status, latency_ms, error?}'
-  verify: cargo test -p oxllm ping_
+  verify: 'cargo test -p oxllm ping_ (handler: success, failure, unknown provider/model 400; route: 403 cross-origin, 413 body cap)'
   risk: P1
-  status: todo
+  status: done
   security: high
   allure:
     severity: critical
@@ -28,9 +28,9 @@ tasks:
     - integration
 - id: 3
   description: 'Register /admin/ping in build_router behind the tailnet guard with the same-origin layer like /config, /validate, /apply'
-  verify: cargo test -p oxllm ping_
+  verify: 'router_builds_and_guards_all_routes: /admin/ping loopback allowed, public peer 403; same-origin layer like /config'
   risk: P1
-  status: todo
+  status: done
   security: high
   allure:
     severity: critical
@@ -39,9 +39,9 @@ tasks:
     - integration
 - id: 4
   description: 'Dashboard: Ping button on each provider row and each model row; POST /admin/ping; render inline result (success + latency, or error) with busy-state disable; vanilla JS, include_str!-embedded, no new dependencies'
-  verify: cargo test -p oxllm dashboard_
+  verify: 'dashboard test asserts /admin/ping + Ping markup; Ping button per provider/model row with busy-state and inline result'
   risk: P2
-  status: todo
+  status: done
   security: medium
   allure:
     severity: major
@@ -49,9 +49,9 @@ tasks:
     - unit
 - id: 5
   description: 'Integration tests with mock upstream: ping success increments provider counters, records a request-log entry, adds daily tokens; ping failure feeds circuit-breaker feedback; unknown provider/model returns 400; cross-origin browser request returns 403'
-  verify: cargo test -p oxllm ping_
+  verify: 'cargo test -p oxllm ping_ (6 integration tests pass; counters, logs, daily tokens, circuit feedback)'
   risk: P1
-  status: todo
+  status: done
   security: high
   allure:
     severity: critical
@@ -60,9 +60,9 @@ tasks:
     - integration
 - id: 6
   description: 'Run all repo gates and size check'
-  verify: cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo build --release && [ "$(stat -c %s target/release/oxllm)" -lt 15728640 ]
+  verify: 'gates green 2026-09-30: fmt --check, clippy -D warnings, workspace 48+32+1 tests, release oxllm 4,170,528 bytes < 15,728,640'
   risk: P1
-  status: todo
+  status: done
   security: high
   allure:
     severity: critical

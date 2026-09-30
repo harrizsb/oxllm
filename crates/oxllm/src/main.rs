@@ -1062,6 +1062,8 @@ const EDITOR_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 async fn editor_json_body_limit(mut request: Request<Body>, next: Next) -> Response {
     if matches!(request.uri().path(), "/validate" | "/apply") {
         DefaultBodyLimit::max(EDITOR_BODY_LIMIT_BYTES).apply(&mut request);
+    } else if request.uri().path() == "/admin/ping" {
+        DefaultBodyLimit::max(4 * 1024).apply(&mut request);
     }
     next.run(request).await
 }
@@ -1089,6 +1091,10 @@ fn build_router(reloadable_state: ReloadableState) -> axum::Router {
         .route(
             "/apply",
             post(handle_post_apply).layer(middleware::from_fn(require_same_origin)),
+        )
+        .route(
+            "/admin/ping",
+            post(routes::admin_ping).layer(middleware::from_fn(require_same_origin)),
         )
         .route("/reload", post(handle_http_reload))
         .route(
@@ -2819,6 +2825,8 @@ mod integration_tests {
         assert!(html.contains("Configuration editor"));
         assert!(html.contains("/config"));
         assert!(html.contains("/validate"));
+        assert!(html.contains("/admin/ping"));
+        assert!(html.contains("Ping"));
         assert!(html.contains("textContent"));
         assert!(html.contains("JSON.stringify({ config: editor.value })"));
     }
@@ -2984,6 +2992,7 @@ mod integration_tests {
             ),
             (axum::http::Method::POST, "/admin/providers/provider/online"),
             (axum::http::Method::POST, "/admin/providers/provider/reset"),
+            (axum::http::Method::POST, "/admin/ping"),
             (axum::http::Method::POST, "/v1/embeddings"),
         ] {
             let response = router
@@ -3015,6 +3024,7 @@ mod integration_tests {
             ),
             (axum::http::Method::POST, "/admin/providers/provider/online"),
             (axum::http::Method::POST, "/admin/providers/provider/reset"),
+            (axum::http::Method::POST, "/admin/ping"),
             (axum::http::Method::POST, "/v1/chat/completions"),
             (axum::http::Method::POST, "/v1/embeddings"),
         ] {
@@ -3059,6 +3069,201 @@ mod integration_tests {
     /// Uses the exact router and security middleware wired by production.
     fn build_test_router(state: ReloadableState) -> axum::Router {
         build_router(state)
+    }
+
+    /// Serves the production router on a loopback port for reqwest clients.
+    async fn spawn_test_router(rs: ReloadableState) -> SocketAddr {
+        let router = build_test_router(rs);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        addr
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: POST /admin/ping (story e02s01)
+    // -----------------------------------------------------------------------
+
+    /// A successful ping sends one real minimal completion and has exact
+    /// parity with a normal request: counters, request log, daily tokens.
+    #[tokio::test]
+    async fn test_integration_ping_success() {
+        let body = r#"{"choices":[{"message":{"role":"assistant","content":"pong"}}],"usage":{"prompt_tokens":10,"completion_tokens":3}}"#;
+        let upstream = spawn_mock_upstream(vec![format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        )])
+        .await;
+
+        let (_app_state, rs) = build_test_state(upstream);
+        let addr = spawn_test_router(rs).await;
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/admin/ping", addr))
+            .json(&serde_json::json!({"provider": "prov", "model": "model"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let result: Value = res.json().await.unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["status"], 200);
+        assert!(result["latency_ms"].is_u64(), "latency_ms missing");
+
+        let status: Value = client
+            .get(format!("http://{}/status", addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let entry = &status["recent_requests"][0];
+        assert_eq!(entry["model_requested"], "model");
+        assert_eq!(entry["provider"], "prov");
+        assert_eq!(entry["status_code"], 200);
+        // Usage parsed like a normal request: 10 prompt + 3 completion.
+        assert_eq!(status["daily_tokens"]["total_tokens"], 13);
+        let target = &status["virtual_models"]["test"][0];
+        assert_eq!(target["requests"], 1);
+        assert_eq!(target["successes"], 1);
+    }
+
+    /// A failed ping returns ok:false with the upstream status and feeds
+    /// circuit-breaker feedback exactly like a normal failed request.
+    #[tokio::test]
+    async fn test_integration_ping_failure_feeds_circuit() {
+        let upstream = spawn_mock_upstream(vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n".to_string(),
+        ])
+        .await;
+
+        let (_app_state, rs) = build_test_state(upstream);
+        let addr = spawn_test_router(rs).await;
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/admin/ping", addr))
+            .json(&serde_json::json!({"provider": "prov", "model": "model"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        let result: Value = res.json().await.unwrap();
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["status"], 500);
+        assert!(result["error"].as_str().is_some_and(|e| !e.is_empty()));
+
+        let status: Value = client
+            .get(format!("http://{}/status", addr))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(status["recent_requests"][0]["status_code"], 500);
+        let target = &status["virtual_models"]["test"][0];
+        assert_eq!(target["requests"], 1);
+        assert_eq!(target["successes"], 0);
+    }
+
+    /// An unknown provider is rejected with 400 and nothing is sent upstream.
+    #[tokio::test]
+    async fn test_integration_ping_unknown_provider_returns_400() {
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_app_state, rs) = build_test_state(upstream);
+        let addr = spawn_test_router(rs).await;
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/admin/ping", addr))
+            .json(&serde_json::json!({"provider": "ghost", "model": "model"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("Unknown provider")));
+    }
+
+    /// A model outside the provider's configured list is rejected with 400.
+    #[tokio::test]
+    async fn test_integration_ping_unknown_model_returns_400() {
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_app_state, rs) = build_test_state(upstream);
+        let addr = spawn_test_router(rs).await;
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/admin/ping", addr))
+            .json(&serde_json::json!({"provider": "prov", "model": "other"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("not configured")));
+    }
+
+    /// A cross-origin browser ping is refused before any upstream call.
+    #[tokio::test]
+    async fn test_integration_ping_cross_origin_forbidden() {
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_app_state, rs) = build_test_state(upstream);
+        let addr = spawn_test_router(rs).await;
+
+        let client = reqwest::Client::new();
+        let res = client
+            .post(format!("http://{}/admin/ping", addr))
+            .header("Origin", "https://evil.example")
+            .json(&serde_json::json!({"provider": "prov", "model": "model"}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 403);
+        let body: Value = res.json().await.unwrap();
+        assert!(body["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("cross-origin")));
+    }
+
+    /// An oversized ping body is refused with 413 before any upstream call.
+    #[tokio::test]
+    async fn test_integration_ping_body_too_large_is_413() {
+        let upstream = spawn_mock_upstream(vec![]).await;
+        let (_app_state, rs) = build_test_state(upstream);
+        let addr = spawn_test_router(rs).await;
+
+        let client = reqwest::Client::new();
+        let huge = "x".repeat(8 * 1024);
+        let res = client
+            .post(format!("http://{}/admin/ping", addr))
+            .json(&serde_json::json!({"provider": huge, "model": huge}))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 413);
     }
 
     // -----------------------------------------------------------------------
