@@ -21,3 +21,5 @@ epics:
     wsjf: 4.0
     capsule_dir: epics/e03-provider-headers-extra-body
     note: "Configurable per-provider headers and JSON additions for chat, embeddings, and Ping."
+    status: released
+    released_at: '2026-10-01T19:55:00Z'
