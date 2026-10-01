@@ -1,0 +1,19 @@
+id: e03
+title: Per-provider upstream headers and extra body parameters
+wsjf: 4.0
+total_bcps: 3
+status: ready
+stories:
+  - id: e03s01
+    title: Append provider-specific headers and JSON body parameters
+    bcps: 3
+    status: ready
+    spec: e03s01-provider-headers-extra-body.md
+    tasks: e03s01-tasks.yaml
+    delta:
+      - type: ADDED
+        ref: ProviderConfig.headers
+        summary: Optional per-provider HTTP header map, validated and appended to chat and embeddings upstream requests
+      - type: ADDED
+        ref: ProviderConfig.extra_body
+        summary: Optional JSON object merged into chat and embeddings request bodies; gateway-owned model and stream fields cannot be overridden

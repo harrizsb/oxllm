@@ -229,6 +229,8 @@ mod tests {
             base_url: Url::parse("https://api.example.com").unwrap(),
             api_key: "test_key".to_string(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["gpt-4".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),

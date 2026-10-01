@@ -2,6 +2,7 @@ e01s01: done
 e01s02: done
 e01s03: done
 e02s01: done
+e03s01: done
 
 stories:
   e01s01:
@@ -20,3 +21,7 @@ stories:
     status: done
     started_at: '2026-09-30T03:59:21Z'
     completed_at: '2026-09-30T15:31:33Z'
+  e03s01:
+    status: done
+    started_at: '2026-10-01T12:40:00Z'
+    completed_at: '2026-10-01T18:30:00Z'

@@ -10,6 +10,7 @@ homepage.workspace = true
 description = "Core adaptive routing engine and telemetry worker for oxllm"
 
 [dependencies]
+http = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

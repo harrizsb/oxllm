@@ -286,7 +286,7 @@ pub async fn create_embeddings(
     headers: HeaderMap,
     body: Bytes, // Bounded ref-counted bytes for zero-cost routing retries
 ) -> impl IntoResponse {
-    let mut payload: Value = match serde_json::from_slice(&body) {
+    let payload: Value = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
             return json_error_response(
@@ -349,6 +349,28 @@ pub async fn create_embeddings(
             },
         };
 
+        let target_provider_state =
+            match app_state.providers.iter().find(|p| p.name == selected.name) {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        request_id = %request_id,
+                        "Provider {} missing from provider state during embeddings routing",
+                        selected.name
+                    );
+                    continue;
+                },
+            };
+
+        // Merge provider-configured extra body keys into the payload.
+        // Provider values replace client collisions. The gateway's model rewrite
+        // follows, so provider config cannot redirect the request.
+        let mut payload = payload.clone();
+        if let Value::Object(map) = &mut payload {
+            for (key, value) in &target_provider_state.extra_body {
+                map.insert(key.clone(), value.clone());
+            }
+        }
         // 1. Rewrite model field in JSON body
         payload["model"] = Value::String(target_model.clone());
         let rewritten_body = Bytes::from(serde_json::to_vec(&payload).unwrap());
@@ -374,6 +396,11 @@ pub async fn create_embeddings(
         // Propagate tracing headers if present
         if let Some(traceparent) = headers.get("traceparent") {
             req = req.header("traceparent", traceparent);
+        }
+
+        // Append provider-configured static headers after gateway-controlled headers.
+        for (name, value) in &target_provider_state.headers {
+            req = req.header(name.clone(), value.clone());
         }
 
         debug!(
@@ -656,7 +683,14 @@ async fn attempt_chat_completion(
 ) -> ChatAttempt {
     let strategy = AdaptivePriorityStrategy;
 
+    // Provider values replace client collisions. The gateway's model rewrite follows,
+    // so provider config cannot redirect the request.
     let mut payload = payload.clone();
+    if let Value::Object(map) = &mut payload {
+        for (key, value) in &provider.extra_body {
+            map.insert(key.clone(), value.clone());
+        }
+    }
     payload["model"] = Value::String(target_model.to_string());
     let rewritten_body = match serde_json::to_vec(&payload) {
         Ok(bytes) => Bytes::from(bytes),
@@ -684,6 +718,11 @@ async fn attempt_chat_completion(
 
     if let Some(user_agent) = provider.user_agent.as_deref() {
         req = req.header(header::USER_AGENT, user_agent);
+    }
+
+    // Append provider-configured static headers after gateway-controlled headers.
+    for (name, value) in &provider.headers {
+        req = req.header(name.clone(), value.clone());
     }
 
     if let Some(traceparent) = headers.get("traceparent") {

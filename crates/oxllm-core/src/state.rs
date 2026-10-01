@@ -21,6 +21,8 @@ pub struct ProviderState {
     pub api_key: String,
     pub models: Vec<String>,
     pub user_agent: Option<String>,
+    pub headers: Vec<(http::HeaderName, http::HeaderValue)>,
+    pub extra_body: serde_json::Map<String, serde_json::Value>,
 
     // Protects volatile metrics without needing a write lock on the entire pool vector
     pub circuit: Arc<RwLock<CircuitState>>,
@@ -157,6 +159,8 @@ mod swrr_tests {
                 base_url: Url::parse("https://example.com").unwrap(),
                 api_key: "key".to_string(),
                 user_agent: None,
+                headers: Vec::new(),
+                extra_body: serde_json::Map::new(),
                 models: vec!["model".to_string()],
                 circuit: Arc::new(RwLock::new(CircuitState::Closed)),
                 consecutive_failures: Arc::new(RwLock::new(0)),

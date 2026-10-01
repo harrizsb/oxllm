@@ -1,7 +1,7 @@
 # specs/release-plan.yaml — release index written during plan-release; WSJF ordering of epics
 release:
-  version: "mirror-only"      # non-authoritative; semantic-release decides at merge
-  codename: "tailscale-gateway-and-dashboard-config-editor"
+  version: "mirror-only"
+  codename: "tailscale-gateway-and-provider-config"
   status: ready_for_release
   semantic_release: true
   bump_hint: minor
@@ -10,15 +10,14 @@ epics:
     title: "Tailscale-only gateway with dashboard config editor"
     wsjf: 4.8
     capsule_dir: epics/e01-tailscale-gateway-editor
-    note: "Single-epic initiative from specs/product/SCOPE_LATEST.yaml; WSJF = (BV 9 + TC 7 + RR 8) / size 5. Story order below is execution order (dependency), not WSJF rank."
-bugs:
-  total: 0
-  fixed: 0
-  deferred: 0
-  wontfix: 0
-  registry: "specs/bugs/registry.yaml (not yet created; no known open bugs)"
+    note: "Single-epic initiative from product scope."
   - id: e02
     title: "Provider-model ping through the main request path"
     wsjf: 4.0
     capsule_dir: epics/e02-provider-model-ping
-    note: "Dashboard Ping control: one real minimal completion per provider+model via the shared chat path. Single-story epic."
+    note: "Dashboard Ping control: one real minimal completion per provider+model via the shared chat path."
+  - id: e03
+    title: "Per-provider upstream headers and extra body parameters"
+    wsjf: 4.0
+    capsule_dir: epics/e03-provider-headers-extra-body
+    note: "Configurable per-provider headers and JSON additions for chat, embeddings, and Ping."

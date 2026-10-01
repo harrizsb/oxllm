@@ -1,0 +1,50 @@
+story_id: e03s01
+title: Append provider-specific headers and JSON body parameters
+status: ready
+bcps: 3
+tasks:
+  - id: 1
+    description: Add optional headers and extra_body to ProviderConfig; add validate-time header parsing/reserved-name checks, JSON representability checks, and protected model/stream keys; add TOML parse/default/validation tests.
+    verify: cargo test -p oxllm-core config::tests::provider_custom
+    risk: P1
+    status: ready
+    security: high
+    allure:
+      severity: critical
+      categories: [unit, Security Review]
+  - id: 2
+    description: Carry validated header values and JSON extra_body through ProviderState and SelectedProvider construction/reload; add focused state/config propagation tests.
+    verify: cargo test -p oxllm-core
+    risk: P1
+    status: ready
+    security: medium
+    allure:
+      severity: major
+      categories: [unit, integration]
+  - id: 3
+    description: Merge provider extra_body into chat payloads before routed model rewrite; append validated headers in the shared attempt helper; test chat and admin ping with a capturing upstream, collision precedence, protected model/stream, and coexistence with user_agent.
+    verify: cargo test -p oxllm ping_ && cargo test -p oxllm chat_forwards_provider_custom
+    risk: P1
+    status: ready
+    security: high
+    allure:
+      severity: critical
+      categories: [integration, Security Review]
+  - id: 4
+    description: Apply provider extra_body and headers to embeddings requests using the same policy; add capturing-upstream integration tests including routed model protection.
+    verify: cargo test -p oxllm embeddings_forwards_provider_custom
+    risk: P1
+    status: ready
+    security: high
+    allure:
+      severity: critical
+      categories: [integration, Security Review]
+  - id: 5
+    description: Run full fmt/clippy/workspace tests; update verification evidence, runtime sample config documentation, and release state only after all task checks pass.
+    verify: cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
+    risk: P2
+    status: ready
+    security: medium
+    allure:
+      severity: major
+      categories: [integration]

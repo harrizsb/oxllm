@@ -915,6 +915,7 @@ name = "oxllm-core"
 version = "0.1.12"
 dependencies = [
  "hex",
+ "http",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

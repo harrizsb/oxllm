@@ -53,6 +53,45 @@ fn resolve_config_path(given: PathBuf) -> PathBuf {
 
 mod routes;
 
+/// Converts validated provider header config into pre-built request headers.
+fn build_provider_headers(
+    p: &oxllm_core::config::ProviderConfig,
+) -> Vec<(axum::http::HeaderName, axum::http::HeaderValue)> {
+    let mut out = Vec::with_capacity(p.headers.len());
+    for (name, value) in &p.headers {
+        match (
+            axum::http::HeaderName::from_bytes(name.as_bytes()),
+            axum::http::HeaderValue::from_str(value),
+        ) {
+            (Ok(n), Ok(v)) => out.push((n, v)),
+            _ => warn!(
+                "Provider '{}' header '{name}' failed re-validation and is skipped",
+                p.name
+            ),
+        }
+    }
+    out
+}
+
+/// Converts provider extra_body config into JSON.
+fn build_provider_extra_body(
+    p: &oxllm_core::config::ProviderConfig,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut out = serde_json::Map::new();
+    for (key, value) in &p.extra_body {
+        match serde_json::to_value(value) {
+            Ok(v) => {
+                out.insert(key.clone(), v);
+            },
+            Err(e) => warn!(
+                "Provider '{}' extra_body key '{key}' is not JSON-representable and is skipped: {}",
+                p.name, e
+            ),
+        }
+    }
+    out
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "oxllm",
@@ -278,12 +317,16 @@ fn build_app_state(config: Config, metrics: Arc<RuntimeMetrics>) -> Result<AppSt
             )
         })?;
 
+        let headers = build_provider_headers(&p);
+        let extra_body = build_provider_extra_body(&p);
         providers.push(ProviderState {
             name: p.name,
             base_url: url,
             api_key: p.api_key,
             models: p.models,
             user_agent: p.user_agent,
+            headers,
+            extra_body,
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
             rate_limited_until: Arc::new(RwLock::new(None)),
@@ -1666,6 +1709,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr1)).unwrap(),
             api_key: "key1".to_string(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["gpt-4-upstream".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1684,6 +1729,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr2)).unwrap(),
             api_key: "key2".to_string(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["gpt-4-upstream".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1797,6 +1844,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}", addr)).unwrap(),
             api_key: "key1".to_string(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["gpt-4-upstream".to_string()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1913,6 +1962,8 @@ mod integration_tests {
             base_url: Url::parse("https://api.fail.example.com/v1/").unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1931,6 +1982,8 @@ mod integration_tests {
             base_url: Url::parse("https://api.ok.example.com/v1/").unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -1986,6 +2039,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2113,6 +2168,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", p1_addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2131,6 +2188,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", p2_addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2245,6 +2304,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2374,6 +2435,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2477,6 +2540,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["real-model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2570,6 +2635,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2676,6 +2743,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -2843,6 +2912,8 @@ mod integration_tests {
             base_url: Url::parse(&format!("http://{}/v1/", upstream_addr)).unwrap(),
             api_key: "key".into(),
             user_agent: None,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -4776,6 +4847,8 @@ mod user_agent_tests {
             base_url: Url::parse(&format!("http://{}/v1/", addr)).unwrap(),
             api_key: "key".into(),
             user_agent,
+            headers: Vec::new(),
+            extra_body: serde_json::Map::new(),
             models: vec!["up-model".into()],
             circuit: Arc::new(RwLock::new(CircuitState::Closed)),
             consecutive_failures: Arc::new(RwLock::new(0)),
@@ -4882,5 +4955,104 @@ mod user_agent_tests {
         let proxy = serve(app_state).await;
         let _ = chat(proxy, "up-model").await;
         assert_eq!(*captured.lock().await, "");
+    }
+
+    /// Capture raw request headers+body from an upstream server.
+    async fn spawn_raw_capture(
+        captured_h: Arc<tokio::sync::Mutex<Vec<(String, String)>>>,
+        captured_b: Arc<tokio::sync::Mutex<Value>>,
+    ) -> SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let parts = raw.split("\r\n\r\n").collect::<Vec<_>>();
+                let hdr = parts.first().unwrap_or(&"");
+                for line in hdr.lines().skip(1) {
+                    if let Some((k, v)) = line.split_once(':') {
+                        captured_h
+                            .lock()
+                            .await
+                            .push((k.trim().into(), v.trim().into()));
+                    }
+                }
+                if let Some(body) = parts.get(1) {
+                    if !body.is_empty() {
+                        if let Ok(v) = serde_json::from_str::<Value>(body) {
+                            *captured_b.lock().await = v;
+                        }
+                    }
+                }
+                let _ = stream.write_all(resp.as_bytes()).await;
+                let _ = stream.flush().await;
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn chat_forwards_provider_custom_headers_and_body() {
+        use axum::http::HeaderName;
+        let h = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let b = Arc::new(tokio::sync::Mutex::new(Value::Null));
+        let upstream = spawn_raw_capture(h.clone(), b.clone()).await;
+        let provider = ProviderState {
+            name: "chk".into(),
+            base_url: Url::parse(&format!("http://{}/v1/", upstream)).unwrap(),
+            api_key: "x".into(),
+            models: vec!["m".into()],
+            user_agent: None,
+            headers: vec![(
+                HeaderName::from_static("x-token-table-modalities"),
+                axum::http::HeaderValue::from_static("text"),
+            )],
+            extra_body: serde_json::Map::from_iter([(
+                "modalities".into(),
+                Value::Array(vec![Value::String("text".into())]),
+            )]),
+            circuit: Arc::new(RwLock::new(CircuitState::Closed)),
+            consecutive_failures: Arc::new(RwLock::new(0)),
+            rate_limited_until: Arc::new(RwLock::new(None)),
+            last_attempt_time: Arc::new(RwLock::new(None)),
+            probe_in_flight: Arc::new(AtomicBool::new(false)),
+            manual_disabled: AtomicBool::new(false),
+            requests: AtomicU64::new(0),
+            successes: AtomicU64::new(0),
+            tokens_input: AtomicU64::new(0),
+            tokens_output: AtomicU64::new(0),
+        };
+        let vm: std::collections::HashMap<String, Vec<VirtualModelTarget>> =
+            std::collections::HashMap::from([(
+                "m".into(),
+                vec![VirtualModelTarget {
+                    provider: "chk".into(),
+                    model: "m".into(),
+                    weight: 1,
+                }],
+            )]);
+        let state = Arc::new(AppState {
+            providers: vec![provider],
+            virtual_models: vm,
+            swrr_current: Mutex::new(std::collections::HashMap::new()),
+            metrics: Arc::new(RuntimeMetrics::default()),
+            http_client: reqwest::Client::builder().build().unwrap(),
+            upstream_timeout_secs: 5,
+        });
+        let proxy = serve(state).await;
+        let _ = chat(proxy, "m").await;
+        let hdrs = h.lock().await;
+        assert!(
+            hdrs.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-token-table-modalities") && v == "text"),
+            "headers={:#?}",
+            *hdrs
+        );
+        let body = b.lock().await;
+        assert!(body.get("modalities").is_some(), "body={:#?}", *body);
     }
 }

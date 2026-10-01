@@ -26,6 +26,12 @@ pub struct ProviderConfig {
     pub models: Vec<String>,
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// Additional static headers for upstream requests. Gateway-owned headers cannot be overridden.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
+    /// Extra JSON request properties. `model` and `stream` are reserved for the gateway/client.
+    #[serde(default)]
+    pub extra_body: HashMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -88,6 +94,7 @@ impl Config {
             },
         }
         for provider in self.providers.iter().filter(|provider| provider.enabled) {
+            validate_provider_custom_options(provider)?;
             let url = reqwest::Url::parse(&provider.base_url).map_err(|error| {
                 OxllmError::ConfigLoad(format!(
                     "Invalid base URL for enabled provider '{}': {}",
@@ -477,5 +484,213 @@ models = ["m"]"#;
         config.providers[0].base_url = "file:///etc/passwd".to_string();
         let error = config.validate().expect_err("non-http scheme must fail");
         assert!(error.to_string().contains("http or https"), "{error}");
+    }
+}
+
+/// Reserved request headers. These are set by the gateway; config cannot override them.
+const RESERVED_PROVIDER_HEADERS: [&str; 5] = [
+    "authorization",
+    "content-type",
+    "user-agent",
+    "host",
+    "content-length",
+];
+
+/// Body keys the gateway owns. Config-level `model` and `stream` would subvert routing
+/// and streaming semantics, so they are rejected outright.
+const RESERVED_EXTRA_BODY_KEYS: [&str; 2] = ["model", "stream"];
+
+fn validate_provider_custom_options(provider: &ProviderConfig) -> Result<()> {
+    for (name, value) in &provider.headers {
+        let lower = name.to_ascii_lowercase();
+        if RESERVED_PROVIDER_HEADERS.contains(&lower.as_str()) {
+            return Err(OxllmError::ConfigLoad(format!(
+                "Provider '{}' header '{name}' is reserved; the gateway owns it",
+                provider.name
+            )));
+        }
+        if http::HeaderName::from_bytes(name.as_bytes()).is_err() {
+            return Err(OxllmError::ConfigLoad(format!(
+                "Provider '{}' has invalid HTTP header name '{name}'",
+                provider.name
+            )));
+        }
+        if http::HeaderValue::from_str(value).is_err() {
+            return Err(OxllmError::ConfigLoad(format!(
+                "Provider '{}' has invalid value for header '{name}': must be visible ASCII without control characters",
+                provider.name
+            )));
+        }
+    }
+    for (key, value) in &provider.extra_body {
+        if RESERVED_EXTRA_BODY_KEYS.contains(&key.as_str()) {
+            return Err(OxllmError::ConfigLoad(format!(
+                "Provider '{}' extra_body key '{key}' is reserved for the gateway/client",
+                provider.name
+            )));
+        }
+        if value.is_datetime() {
+            return Err(OxllmError::ConfigLoad(format!(
+                "Provider '{}' extra_body key '{key}' has a TOML datetime value, which has no JSON representation",
+                provider.name
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod provider_custom_tests {
+    use super::*;
+
+    fn provider_with_custom() -> &'static str {
+        r#"
+        [server]
+        host = "127.0.0.1"
+        port = 8080
+        otel_endpoint = ""
+
+        [[providers]]
+        name = "provider-a"
+        enabled = true
+        base_url = "https://example.com"
+        api_key = "key"
+        models = ["model-a"]
+        user_agent = "pi/0.99.1"
+        headers = { X-TokenTable-Modalities = "text", x-custom-a = "value a" }
+        extra_body = { modalities = ["text"], reasoning = { effort = "low" } }
+        "#
+    }
+
+    fn minimal_with_body(raw: &str) -> Config {
+        let source = format!(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = ""
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            {}"#,
+            raw
+        );
+        toml::from_str(&source).expect("config must parse")
+    }
+
+    #[test]
+    fn provider_custom_headers_and_extra_body_parse() {
+        let config: Config = toml::from_str(provider_with_custom()).unwrap();
+        config.validate().expect("valid config must validate");
+
+        assert_eq!(
+            config.providers[0]
+                .headers
+                .get("X-TokenTable-Modalities")
+                .map(String::as_str),
+            Some("text")
+        );
+        assert_eq!(
+            config.providers[0]
+                .headers
+                .get("x-custom-a")
+                .map(String::as_str),
+            Some("value a")
+        );
+
+        let modalities = config.providers[0]
+            .extra_body
+            .get("modalities")
+            .expect("modalities key present");
+        assert_eq!(
+            modalities.as_array(),
+            Some(&vec![toml::Value::String("text".to_string())])
+        );
+        assert!(config.providers[0].extra_body.contains_key("reasoning"));
+    }
+
+    #[test]
+    fn provider_custom_defaults_empty() {
+        let config: Config = toml::from_str(
+            r#"
+            [server]
+            host = "127.0.0.1"
+            port = 8080
+            otel_endpoint = ""
+
+            [[providers]]
+            name = "provider-a"
+            enabled = true
+            base_url = "https://example.com"
+            api_key = "key"
+            models = ["model-a"]
+            "#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        assert!(config.providers[0].headers.is_empty());
+        assert!(config.providers[0].extra_body.is_empty());
+    }
+
+    #[test]
+    fn provider_headers_reject_invalid_name() {
+        let config = minimal_with_body(r#"headers = { "Bad Header" = "v" }"#);
+        let err = config.validate().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("provider-a"),
+            "diagnostic names provider: {msg}"
+        );
+        assert!(msg.contains("Bad Header"), "diagnostic names key: {msg}");
+    }
+
+    #[test]
+    fn provider_headers_reject_invalid_value() {
+        let config = minimal_with_body("headers = { X-Test = \"bad\\u000Avalue\" }");
+        let err = config.validate().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("X-Test"), "diagnostic names key: {msg}");
+    }
+
+    #[test]
+    fn provider_headers_reject_reserved_override() {
+        for reserved in [
+            "Authorization",
+            "content-type",
+            "USER-AGENT",
+            "Host",
+            "content-length",
+        ] {
+            let config = minimal_with_body(&format!("headers = {{ {reserved} = \"v\" }}"));
+            let err = config.validate().unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(msg.contains("reserved"), "({reserved}) msg: {msg}");
+        }
+    }
+
+    #[test]
+    fn provider_extra_body_rejects_model_and_stream() {
+        for protected in ["model", "stream"] {
+            let config = minimal_with_body(&format!(r#"extra_body = {{ {protected} = "x" }}"#));
+            let err = config.validate().unwrap_err();
+            let msg = format!("{err:?}");
+            assert!(
+                msg.contains(protected),
+                "({protected}) diagnostic names key: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_extra_body_rejects_toml_datetime() {
+        let config = minimal_with_body("extra_body = { when = 2026-10-01T00:00:00Z }");
+        let err = config.validate().unwrap_err();
+        let msg = format!("{err:?}");
+        assert!(msg.contains("when"), "diagnostic names key: {msg}");
     }
 }
