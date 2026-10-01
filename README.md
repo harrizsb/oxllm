@@ -17,8 +17,13 @@ Built to operate entirely in memory with zero local disk persistence, `oxllm` is
 * **&lt;2ms Routing Overhead**: Lock-free concurrency across routing loop, counters, and probe permits. Verified by CI benchmark.
 * **Adaptive Circuit Breaker**: Strict `HalfOpen` state machine with lock-free `probe_in_flight` atomic check-and-set. Rate limits and server errors trip per-provider circuits with exponential backoff. Idle-based penalty decay automatically rehabilitates providers.
 * **Tiered Failover**: Configure fallback chains across multiple providers. If the primary returns 429 or 5xx, the proxy transparently cascades to the next.
+* **Weighted Virtual-Model Routing**: Virtual model targets accept a `weight` field (default 1). The SWRR algorithm cycles through weighted provider slots, enabling traffic distribution among equally-capable providers (e.g., 3:1 ratio). Dashboard shows each target's share percentage.
+* **Per-Provider User Agent**: Set an optional `user_agent` per provider to override the User-Agent header on upstream chat-completion requests.
+* **Per-Provider Custom Headers**: Add static `headers` maps to providers (`{ X-Custom-Header = "value" }`) appended after gateway-owned headers.
+* **Per-Provider Extra Body**: Add `extra_body` maps to merge additional JSON fields into upstream requests (`{ modalities = ["text"] }`). Keys `model` and `stream` are reserved.
 * **Hot Config Reloading**: `SIGHUP` signal or `POST /reload` HTTP endpoint — parses updated `config.toml` and hot-swaps the provider pool via `tokio::sync::watch` without dropping connections.
-* **Local Stats Dashboard**: Every provider tracks request count, success count, token volumes, and last request time via lock-free atomics. Query via `oxllm status` or `curl /status` — no external collector needed.
+* **Live Stats Dashboard**: Local `/status` endpoint displays ASCII tables of provider metrics (requests, successes, tokens, circuit state). Accessible via `oxllm status` CLI or `curl /status`. Also includes a raw config editor on `/dashboard`.
+* **Provider-model Ping**: Test any provider+model directly from the dashboard using the `/admin/ping` endpoint — sends one real completion and reports latency/status inline.
 * **OOM-Proof Telemetry**: Bounded OTel event channel (1024 cap) with non-blocking `try_send` drops. If `otelite` is offline, telemetry degrades gracefully and the proxy keeps running.
 * **W3C Trace Context Propagation**: Extracts and injects `traceparent` headers for continuous trace spans.
 * **Tailscale-Ready Binding**: Binds the configured IPv4 `host` plus a loopback listener so local CLI tools keep working; `bind_family` is retained only for config compatibility and must stay `"ipv4"`.
@@ -174,6 +179,37 @@ oxllm serve --config config-local-test.toml
 
 Each provider requires `name`, `enabled`, `base_url` (with trailing `/v1/`), `api_key` (or `${VAR}` env reference), and `models` list.
 
+#### Optional Provider Fields
+- `user_agent`: Optional `User-Agent` value for upstream chat-completion requests. If omitted, oxllm does not set this override.
+- `headers`: Additional static headers for upstream requests. Use inline TOML tables (`{ X-Custom-Header = "value" }`) to append after gateway-owned headers. Reserved headers cannot be overridden.
+- `extra_body`: Extra JSON properties merged into chat, embeddings, and Ping request bodies. Provider values replace same-named client properties. The gateway then rewrites `model`; `model` and `stream` are reserved and rejected in this map.
+
+#### Example Provider
+```toml
+[[providers]]
+name = "openrouter-basic"
+enabled = true
+base_url = "https://openrouter.ai/api/v1/"
+api_key = "${OPENROUTER_API_KEY}"
+models = ["ibm-granite/granite-4.1-8b"]
+user_agent = "my-app/1.0"
+headers = { X-TokenTable-Modalities = "text" }
+extra_body = { modalities = ["text"], reasoning = { effort = "low" } }
+```
+
+#### Example
+```toml
+[[providers]]
+name = "openrouter-basic"
+enabled = true
+base_url = "https://openrouter.ai/api/v1/"
+api_key = "${OPENROUTER_API_KEY}"
+models = ["ibm-granite/granite-4.1-8b"]
+user_agent = "my-app/1.0"
+headers = { X-TokenTable-Modalities = "text", x-custom-a = "value a" }
+extra_body = { modalities = ["text"], reasoning = { effort = "low" } }
+```
+
 ### Virtual Models (Fallback Chains)
 
 Virtual models define the routing order. If a provider returns 429 or 5xx, the proxy transparently tries the next:
@@ -190,7 +226,7 @@ smart = [
 ### How the Routing Algorithm Works
 
 1. When a request arrives, the proxy iterates the virtual model's provider list in order.
-2. For each provider, it checks: **circuit breaker state** (Closed? Open? HalfOpen?), **rate-limit window** (cooling down?), **manual override** (admin-disabled?).
+2. For each provider, it checks: **circuit breaker state** (Closed? Open? HalfOpen?), **rate-limit window** (cooling down?), **manual override** (admin-disabled?);
 3. The first healthy provider is selected for the request.
 4. On success: circuit resets to Closed, failure count drops to 0.
 5. On 429 (rate limit): sets a cooldown timer based on `retry-after` header (default 30s). After 3 failures, circuit opens.
@@ -202,6 +238,29 @@ smart = [
 
 - `config.toml` — 6 cloud providers across 2 tiers (smart + basic)
 - `config-local-test.toml` — local Ollama only, zero API keys
+
+---
+
+## 🌐 API Endpoints
+
+| Method | Path | Description | Access |
+| :--- | :--- | :--- | :--- |
+| **POST** | `/v1/chat/completions` | Standard chat completions (supports `stream: true/false`). | Public (tailnet) |
+| **POST** | `/v1/embeddings` | Standard text embeddings with auto-retry failover. | Public (tailnet) |
+| **GET** | `/v1/models` | List of currently healthy virtual models. | Public (tailnet) |
+| **GET** | `/status` | ASCII status table of provider pool metrics and virtual-model routing. | Tailnet/loopback |
+| **GET** | `/dashboard` | Read-only dashboard with config editor and Ping controls. | Tailnet/loopback |
+| **GET** | `/config` | Raw `config.toml` bytes with `${VAR}` placeholders preserved. | Tailnet/loopback, same-origin browser check |
+| **POST** | `/validate` | Dry-run config validation pipeline (zero disk writes). Body limit: 1 MiB. | Tailnet/loopback, same-origin browser check |
+| **POST** | `/apply` | Apply validated config atomically with one-generation backup. Body limit: 1 MiB. | Tailnet/loopback, same-origin browser check |
+| **POST** | `/admin/ping` | Send one real minimal completion (`max_tokens: 1`) pinned to a provider+model, return `{ok, status, latency_ms, error?}`. | Tailnet/loopback, same-origin browser check |
+| **POST** | `/reload` | Trigger SIGHUP-equivalent config hot-reload via HTTP. | Tailnet/loopback |
+| **GET** | `/health` | Gateway live healthcheck indicator. | Tailnet/loopback |
+| **POST** | `/admin/providers/{name}/offline` | Manually disable a provider. | Tailnet/loopback |
+| **POST** | `/admin/providers/{name}/online` | Re-enable a disabled provider. | Tailnet/loopback |
+| **POST** | `/admin/providers/{name}/reset` | Reset a provider's circuit-breaker state and counters. | Tailnet/loopback |
+
+The ping endpoint has full parity with a normal request: it increments provider request/success counters, feeds circuit-breaker feedback, records a request-log entry, adds daily tokens, and emits telemetry — identical to a normal request.
 
 ---
 

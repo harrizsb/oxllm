@@ -45,12 +45,21 @@
 1.  `POST /v1/chat/completions` – Supports both standard JSON payloads and Server-Sent Events (SSE) streaming (`stream: true`).
 2.  `POST /v1/embeddings` – Standard non-streaming batch vectors.
 3.  `GET /v1/models` – Returns a consolidated virtual array of all models exposed by currently active and healthy upstream providers.
-4.  `GET /status` – Administrative endpoint displaying per-provider circuit state, request counters, token volumes, and last request time. Localhost-restricted.
-5. `POST /reload` – Administrative endpoint triggering config hot-reload via HTTP. Same effect as SIGHUP. Localhost-restricted.
-6. `GET /health` – Lightweight health-check endpoint. Localhost-restricted.
-7. `POST /admin/providers/{name}/offline` – Manually mark a provider as disabled. Localhost-restricted.
-8. `POST /admin/providers/{name}/online` – Re-enable a manually disabled provider. Localhost-restricted.
-9. `POST /admin/providers/{name}/reset` – Reset a provider's circuit-breaker state and failure counters. Localhost-restricted.
+4.  `GET /status` – Administrative endpoint displaying per-provider circuit state, request counters, token volumes, and last request time. Tailnet/loopback restricted.
+5.  `GET /dashboard` – Read-only dashboard with config editor and Ping controls. Tailnet/loopback restricted.
+6.  `GET /config` – Retrieves the raw `config.toml` bytes with `${VAR}` placeholders preserved. Same-origin browser restriction, Tailnet/loopback access.
+7.  `POST /validate` – Runs a full parse → expand → validate → `build_app_state` pipeline as a dry run, returning diagnostics. Same-origin browser restriction, Tailnet/loopback access. Body limited to 1 MiB.
+8.  `POST /apply` – Apply new config: validates and builds new state, stages backups, syncs, publishes. Same-origin browser restriction, Tailnet/loopback access. Body limited to 1 MiB.
+9.  `POST /admin/ping` – Sends one real minimal completion (max_tokens 1) pinned to a requested provider+model, reports `{ok, status, latency_ms, error?}`. Same-origin browser restriction, Tailnet/loopback access.
+10. `POST /reload` – Administrative endpoint triggering config hot-reload via HTTP. Same effect as SIGHUP. Tailnet/loopback restricted.
+11. `GET /health` – Lightweight health-check endpoint. Tailnet/loopback restricted.
+12. `POST /admin/providers/{name}/offline` – Manually mark a provider as disabled. Tailnet/loopback restricted.
+13. `POST /admin/providers/{name}/online` – Re-enable a manually disabled provider. Tailnet/loopback restricted.
+14. `POST /admin/providers/{name}/reset` – Reset a provider's circuit-breaker state and failure counters. Tailnet/loopback restricted.
+
+All public endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) return CORS headers (`Access-Control-Allow-Origin: *`) and include an `x-request-id` correlation header on every response.
+
+All administrative and configuration endpoints (`/config`, `/validate`, `/apply`, `/dashboard`, `/status`, `/health`, `/reload`, `/admin/*`) are protected by a Tailnet-only boundary (loopback and IPv4 CGNAT range `100.64.0.0/10`) and, for browser endpoints (`/config`, `/validate`, `/apply`, `/dashboard`), a same-origin layer that rejects cross-origin `Origin` headers.
 
 All public endpoints (`/v1/chat/completions`, `/v1/embeddings`, `/v1/models`) return CORS headers (`Access-Control-Allow-Origin: *`) and include an `x-request-id` correlation header on every response.
 
@@ -103,6 +112,18 @@ pub struct ProviderState {
     * Immediately drop the connection to this upstream, advance the loop index, and dispatch to the next available provider.
 5. **Mid-Stream Fallback**: If an upstream accepts the connection with a `200 OK` and fails mid-stream during an SSE event transfer, the proxy will transparently forward the disconnect to the downstream agent. As of v0.1.9, streaming success feedback is deferred until stream completion, and mid-stream failures ARE counted as failures (incrementing `consecutive_failures`). The proxy does not attempt to hot-swap upstreams mid-flight to avoid corrupted JSON token streams.
 
+#### Weighted Routing Algorithm
+The proxy supports weighted virtual-model routing using a smooth weighted round-robin (SWRR) algorithm. Each target in a virtual model can have a `weight` field (default 1). Higher weights increase the provider's share of traffic in weighted routing schemes.
+
+The SWRR algorithm maintains one small cursor per virtual model (in `AppState.swrr_current`) to keep track of the current position in the cycle. During each request, the algorithm advances the cursor by one smooth weighted step:
+1.  For each target, add its weight to the current cursor value.
+2.  Select the target with the highest cumulative value.
+3.  Subtract the total weight from the selected target's cursor value.
+
+This ensures that providers with higher weights are selected more frequently while maintaining a smooth distribution across the entire cycle. Equal default weights preserve the existing target order over each complete cycle.
+
+Example: With targets `[A(weight=3), B(weight=1)]`, the selection pattern will be `A,A,A,B,A,A,A,B,...`.
+
 ### 3.2. Configuration Schema & Hot Reloading
 Configuration is declared in a single `config.toml` file (avoiding deprecated YAML dependencies).
 
@@ -121,6 +142,10 @@ enabled = true
 base_url = "https://generativelanguage.googleapis.com/v1beta/openai"
 api_key = "${AI_STUDIO_KEY}" # Supports raw string or environment variable mapping
 models = ["gemini-2.5-flash"]
+# Optional provider request customization:
+user_agent = "my-app/1.0"
+headers = { X-TokenTable-Modalities = "text" }
+extra_body = { modalities = ["text"] }
 
 [[providers]]
 name = "groq"
@@ -138,8 +163,8 @@ models = ["llama-3.3-70b-instruct"]
 
 [virtual_models]
 llama-3.3-70b = [
-  { provider = "sambanova", model = "llama-3.3-70b-instruct" },
-  { provider = "groq", model = "llama-3.3-70b-versatile" }
+  { provider = "sambanova", model = "llama-3.3-70b-instruct", weight = 3 },
+  { provider = "groq", model = "llama-3.3-70b-versatile", weight = 1 }
 ]
 complex-free = [
   { provider = "groq", model = "deepseek-r1-distill" },
@@ -148,11 +173,27 @@ complex-free = [
 ]
 ```
 
+#### Provider Request Customization
+Each `[[providers]]` entry may include:
+* `user_agent`: Optional `User-Agent` value for upstream chat completion requests.
+* `headers`: Optional map of additional static HTTP headers. Headers are appended after gateway-owned headers; reserved gateway headers cannot be overridden.
+* `extra_body`: Optional map of additional JSON request-body properties. These values replace same-named client properties; the gateway then rewrites `model` to the configured upstream model. The `model` and `stream` keys are reserved and rejected during config validation.
+
+For example:
+```toml
+headers = { X-TokenTable-Modalities = "text" }
+extra_body = { modalities = ["text"], reasoning = { effort = "low" } }
+```
+The same custom header and body parameters are applied to chat, embeddings, and admin Ping requests.
+
 #### Reloading Mechanism
 To keep the binary free of intensive filesystem polling threads:
 * **POSIX Signal Handling:** The application listens for a `SIGHUP` signal.
-* **HTTP Reload Endpoint:** A `POST /reload` endpoint (localhost-restricted) triggers the same logic.
-* **Action:** Upon intercepting either trigger, the configuration file is re-parsed. New keys or target providers are mapped into a fresh `Vec<ProviderState>`, and the pointer is safely updated using a `tokio::sync::watch` channel, maintaining current uptime for connected clients.
+* **HTTP Reload Endpoint:** A `POST /reload` endpoint triggers the same logic.
+* **Action:** Upon intercepting either trigger, the configuration file is re-parsed. New keys or target providers are mapped into a fresh provider state, and the new state is published. Runtime provider counters, circuit state, admin-disabled flags, and SWRR cursors reset on reload; daily token counters and the recent request log persist.
+
+#### Configuration Editor and Body Limits
+The dashboard's editor uses `GET /config`, `POST /validate` (dry-run), and `POST /apply`. `/validate` and `/apply` accept request bodies up to 1 MiB; larger bodies are rejected with HTTP 413 before config parsing or application. Config endpoints are protected against browser cross-origin requests using the `Origin` header check. This is not authentication; Tailnet/loopback access remains the access boundary.
 
 ---
 

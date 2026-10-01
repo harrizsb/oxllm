@@ -28,6 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`server.host`, `server.port`, `server.otel_endpoint`).
 - **Dashboard configuration editor**: raw TOML textarea with Load, Validate (dry-run), and Apply
   (confirmation dialog, busy-state disable) using safe `textContent` rendering for diagnostics.
+- **Weighted virtual-model routing**: Virtual model targets accept a `weight` field (default 1).
+  The SWRR algorithm cycles through weighted provider slots, enabling traffic distribution among
+  equally‑capable providers (e.g., 3:1 ratio). The dashboard shows each target's share percentage.
+- **Per-provider User‑Agent**: Add optional `user_agent` to `[[providers]]` blocks in `config.toml`.
+  Sets the `User-Agent` header for chat and embeddings requests to the configured value; the gateway
+  passes the configured value verbatim. The value must be a valid HTTP header field value.
+- **Per-provider custom headers and extra body parameters**: Add optional `headers` and `extra_body`
+  maps to `[[providers]]` blocks in `config.toml`. `headers = { X-TokenTable-Modalities = "text" }`
+  appends static headers to upstream requests after gateway-owned headers. `extra_body = { modalities = ["text"] }`
+  merges JSON values into the upstream request body before the `model` rewrite. Keys `model` and `stream` are
+  reserved for the gateway/client and cannot be overridden. Invalid header names/values and TOML datetimes
+  are rejected at validation with clear diagnostics.
+- **Provider-model Ping endpoint**: Add `POST /admin/ping` to send one real minimal completion (max_tokens 1)
+  through the shared chat-completions attempt path, pinned to a requested provider+model. Returns `{ok, status, latency_ms, error?}`.
+  Has exact parity with a normal request: increments counters, feeds circuit-breaker feedback, logs request,
+  adds daily tokens, and emits telemetry. Sits behind the tailnet guard and same-origin layer.
+- **Dashboard Ping controls**: Each provider row and each model row in the dashboard includes a Ping button.
+  Clicking sends the ping and displays the result inline (success with latency or upstream error).
 
 ### Security
 - **Editor endpoints reject cross-origin browsers**: `GET /config`, `POST /validate`, and
@@ -38,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Strict config schema**: unknown fields are rejected (`deny_unknown_fields`) on server,
   provider, and virtual-model target sections; malformed enabled-provider URLs and invalid bind
   hosts fail validation before the server starts or before Apply writes anything.
+- **Body size limit on editor endpoints**: `POST /validate` and `POST /apply` enforce a 1 MiB request body limit with a 413 Payload Too Large response; oversized configs are rejected before any parsing or secret disclosure. The limit is applied via `DefaultBodyLimit` middleware scoped to those routes.
 
 ### Changed
 - **Reload semantics made explicit**: daily token counters and the last-3 request log persist
